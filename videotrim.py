@@ -3,7 +3,6 @@
 
 import json
 import os
-import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -36,12 +35,35 @@ SUPPORTED_FORMATS = (
 )
 
 ENCODING_STREAM_COPY = "Stream Copy (fast, no re-encoding)"
-ENCODING_VT_H264 = "H.264 (Apple VideoToolbox)"
-ENCODING_VT_HEVC = "HEVC (Apple VideoToolbox)"
+
+# (label, ffmpeg encoder name, UI hint)
+HW_ENCODERS = [
+    ("H.264 (Apple VideoToolbox)", "h264_videotoolbox",
+     "Hardware-accelerated H.264 — frame-accurate, fast"),
+    ("HEVC (Apple VideoToolbox)", "hevc_videotoolbox",
+     "Hardware-accelerated HEVC — frame-accurate, smaller files"),
+    ("H.264 (Intel QSV)", "h264_qsv",
+     "Hardware-accelerated H.264 via Intel Quick Sync"),
+    ("HEVC (Intel QSV)", "hevc_qsv",
+     "Hardware-accelerated HEVC via Intel Quick Sync"),
+    ("AV1 (Intel QSV)", "av1_qsv",
+     "Hardware-accelerated AV1 via Intel Quick Sync — best compression"),
+]
 
 
-def _is_apple_silicon() -> bool:
-    return sys.platform == "darwin" and platform.machine() == "arm64"
+def _probe_available_hw_encoders() -> list[tuple[str, str, str]]:
+    """Probe ffmpeg for available hardware encoders."""
+    try:
+        result = subprocess.run(
+            [FFMPEG, "-encoders", "-hide_banner"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        output = result.stdout
+        return [(label, enc, hint) for label, enc, hint in HW_ENCODERS if enc in output]
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return []
 
 
 def _find_tool(name: str) -> str:
@@ -121,6 +143,7 @@ class VideoTrimWindow(QMainWindow):
         self.video_duration_ms = 0
         self.frame_duration_ms = 33  # default ~30fps, updated on load
         self._slider_pressed = False
+        self._available_hw_encoders = _probe_available_hw_encoders()
         self._build_ui()
         self._setup_player()
 
@@ -248,9 +271,8 @@ class VideoTrimWindow(QMainWindow):
         encoding_layout.addWidget(QLabel("Mode:"))
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItem(ENCODING_STREAM_COPY)
-        if _is_apple_silicon():
-            self.encoding_combo.addItem(ENCODING_VT_H264)
-            self.encoding_combo.addItem(ENCODING_VT_HEVC)
+        for label, _enc, _hint in self._available_hw_encoders:
+            self.encoding_combo.addItem(label)
         encoding_layout.addWidget(self.encoding_combo, stretch=1)
 
         self.encoding_hint = QLabel("")
@@ -296,10 +318,11 @@ class VideoTrimWindow(QMainWindow):
     def _on_encoding_changed(self, text: str):
         if text == ENCODING_STREAM_COPY:
             self.encoding_hint.setText("Fastest — cuts on nearest keyframe, no quality loss")
-        elif text == ENCODING_VT_H264:
-            self.encoding_hint.setText("Hardware-accelerated H.264 — frame-accurate, fast")
-        elif text == ENCODING_VT_HEVC:
-            self.encoding_hint.setText("Hardware-accelerated HEVC — frame-accurate, smaller files")
+            return
+        for label, _enc, hint in self._available_hw_encoders:
+            if text == label:
+                self.encoding_hint.setText(hint)
+                return
 
     def _setup_player(self):
         self.player = QMediaPlayer()
@@ -499,17 +522,25 @@ class VideoTrimWindow(QMainWindow):
             ]
         else:
             # Re-encode: output seeking (-ss after -i) for frame accuracy
-            if mode == ENCODING_VT_H264:
-                video_codec = "h264_videotoolbox"
-            else:
-                video_codec = "hevc_videotoolbox"
+            video_codec = None
+            for label, enc, _hint in self._available_hw_encoders:
+                if mode == label:
+                    video_codec = enc
+                    break
+
+            quality_args = []
+            if "videotoolbox" in video_codec:
+                quality_args = ["-q:v", "65"]
+            elif "qsv" in video_codec:
+                quality_args = ["-global_quality", "18"]
+
             cmd = [
                 FFMPEG, "-y",
                 "-i", input_path,
                 "-ss", start,
                 "-to", end,
                 "-c:v", video_codec,
-                "-q:v", "65",
+                *quality_args,
                 "-c:a", "aac",
                 "-map", "0",
                 "-avoid_negative_ts", "make_zero",
