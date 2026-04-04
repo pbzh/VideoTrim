@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VideoTrim</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- File selection -->
+    <div class="group">
+      <div class="group-title">Video File</div>
+      <div class="row">
+        <input type="text" id="file-path" readonly placeholder="No file selected" class="path-input" />
+        <button id="browse-btn" class="btn">Browse…</button>
+      </div>
+    </div>
+
+    <div id="info-label" class="info-text"></div>
+
+    <!-- Video preview -->
+    <div class="video-container">
+      <video id="video-preview" preload="metadata"></video>
+      <div id="video-placeholder" class="video-placeholder">No video loaded</div>
+    </div>
+
+    <!-- Playback controls -->
+    <div class="controls-row">
+      <button id="play-btn" class="btn btn-icon" disabled>&#9654;</button>
+      <button id="step-back-1s" class="btn btn-sm" disabled>-1s</button>
+      <button id="step-back-frame" class="btn btn-sm" disabled>&lt;</button>
+      <button id="step-fwd-frame" class="btn btn-sm" disabled>&gt;</button>
+      <button id="step-fwd-1s" class="btn btn-sm" disabled>+1s</button>
+      <span id="position-label" class="time-label">00:00:00.000</span>
+      <input type="range" id="scrub-slider" min="0" max="0" value="0" class="scrub-slider" disabled />
+      <span id="total-label" class="time-label">00:00:00.000</span>
+    </div>
+
+    <!-- Trim range -->
+    <div class="group">
+      <div class="group-title">Trim Range</div>
+      <div class="row trim-row">
+        <label>Start:</label>
+        <input type="text" id="start-time" class="time-input" value="00:00:00.000" />
+        <button id="set-start-btn" class="btn" disabled>Set Start</button>
+        <div class="trim-spacer"></div>
+        <label>End:</label>
+        <input type="text" id="end-time" class="time-input" value="00:00:00.000" />
+        <button id="set-end-btn" class="btn" disabled>Set End</button>
+        <div class="trim-spacer"></div>
+        <span id="duration-label" class="info-text"></span>
+      </div>
+    </div>
+
+    <!-- Encoding -->
+    <div class="group">
+      <div class="group-title">Encoding</div>
+      <div class="row">
+        <label>Mode:</label>
+        <select id="encoding-combo" class="combo"></select>
+        <span id="encoding-hint" class="info-text encoding-hint"></span>
+      </div>
+    </div>
+
+    <!-- Output -->
+    <div class="group">
+      <div class="group-title">Output</div>
+      <div class="row">
+        <input type="text" id="output-path" class="path-input" placeholder="Auto-generated from input filename" />
+        <button id="output-browse-btn" class="btn">Browse…</button>
+      </div>
+    </div>
+
+    <!-- Trim button -->
+    <button id="trim-btn" class="btn btn-primary" disabled>Trim Video</button>
+
+    <!-- Progress -->
+    <div id="progress-container" class="progress-container hidden">
+      <div class="progress-track"><div class="progress-fill"></div></div>
+      <span class="progress-text">Trimming…</span>
+    </div>
+
+    <!-- Status -->
+    <div id="status-label" class="status-label"></div>
+
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>

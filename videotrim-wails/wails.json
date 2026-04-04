@@ -1,0 +1,18 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "VideoTrim",
+  "outputfilename": "VideoTrim",
+  "frontend": {
+    "dir": "frontend",
+    "install": "",
+    "build": "",
+    "devWatcher": "",
+    "devServerUrl": ""
+  },
+  "version": "2",
+  "info": {
+    "productName": "VideoTrim",
+    "productVersion": "1.0.0",
+    "productDescription": "Simple video trimmer"
+  }
+}
