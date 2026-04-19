@@ -72,14 +72,20 @@ def _find_tool(name: str) -> str:
 
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent
+        candidates = []
         if sys.platform == "darwin":
-            # py2app .app bundle
-            candidate = base.parent / "Resources" / "ffmpeg" / exe_name
-        else:
-            # PyInstaller on Windows / Linux
-            candidate = base / "ffmpeg" / exe_name
-        if candidate.is_file():
-            return str(candidate)
+            # py2app / PyInstaller .app bundle
+            candidates.append(base.parent / "Resources" / "ffmpeg" / exe_name)
+            candidates.append(base.parent / "Frameworks" / "ffmpeg" / exe_name)
+        # PyInstaller layouts: onedir (pre-6 beside exe; 6+ under _internal/), onefile (_MEIPASS)
+        candidates.append(base / "ffmpeg" / exe_name)
+        candidates.append(base / "_internal" / "ffmpeg" / exe_name)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "ffmpeg" / exe_name)
+        for c in candidates:
+            if c.is_file():
+                return str(c)
 
     return exe_name
 

@@ -1,0 +1,13 @@
+# PyInstaller build artifacts (bundles ffmpeg, ~500 MB — build locally)
+/build/
+/dist/
+*.spec~
+
+# Editor / OS
+.claude/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Wails intermediate
+videotrim-wails/build/bin/*.exe~
