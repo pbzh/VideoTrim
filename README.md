@@ -17,6 +17,7 @@ Both use ffmpeg under the hood and share the same feature set.
 - Displays video format, codec, and audio information
 - Auto-generates output filename (`_trimmed` suffix)
 - Overwrite confirmation for existing files
+- Graceful preview error handling — unsupported formats show a warning but trimming still works via ffmpeg
 
 ---
 
@@ -91,6 +92,49 @@ python videotrim.py
 
 ---
 
+## Building a standalone executable (PyInstaller)
+
+Both scripts bundle ffmpeg/ffprobe into the output directory so the app runs
+self-contained — no Python or ffmpeg installation required on the target machine.
+
+### Windows — `build-windows.ps1`
+
+**Requirements:** Python 3.10+, PyInstaller, ffmpeg on PATH
+
+```powershell
+pip install PyQt6 pyinstaller
+winget install ffmpeg   # or drop ffmpeg.exe / ffprobe.exe onto your PATH manually
+```
+
+Run the build script from a PowerShell prompt:
+
+```powershell
+.\build-windows.ps1
+```
+
+Output: `build\windows-python\dist\VideoTrim\VideoTrim.exe`
+
+To run on another machine, copy the entire `VideoTrim\` folder — the exe and
+the `_internal\` directory alongside it must stay together.
+
+### macOS — `build-macos.sh`
+
+**Requirements:** Python 3.10+, PyInstaller, ffmpeg via Homebrew
+
+```bash
+pip3 install PyQt6 pyinstaller
+brew install ffmpeg
+```
+
+```bash
+chmod +x build-macos.sh
+./build-macos.sh
+```
+
+Output: `build/macos-python/dist/VideoTrim.app`
+
+---
+
 ## Usage
 
 1. Click **Browse** to select a video file
@@ -108,6 +152,10 @@ python videotrim.py
    Hardware encoding options are auto-detected at startup and only shown when your system supports them.
 5. Optionally change the output path
 6. Click **Trim Video**
+
+> **Note:** If the built-in preview shows an error (e.g. HEVC on Windows without
+> the HEVC Video Extensions codec pack), the status bar will say so but trimming
+> still works — ffmpeg handles all formats regardless of what the OS decoder supports.
 
 ## Supported formats
 
