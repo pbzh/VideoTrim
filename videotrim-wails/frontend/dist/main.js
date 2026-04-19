@@ -181,6 +181,18 @@ video.addEventListener('play',  () => { playBtn.textContent = '\u23F8'; });  // 
 video.addEventListener('pause', () => { playBtn.innerHTML = '&#9654;'; });   // ▶
 video.addEventListener('ended', () => { playBtn.innerHTML = '&#9654;'; });
 
+video.addEventListener('error', () => {
+  const codes = {
+    1: 'Playback aborted',
+    2: 'Network error loading video',
+    3: 'Video decode failed',
+    4: 'Format or codec not supported by the preview (WebView2 supports MP4/H.264, WebM/VP9/AV1; MKV/AVI/WMV/HEVC will not preview). Trimming still works.',
+  };
+  const err = video.error;
+  const msg = err ? (codes[err.code] || `Video error code ${err.code}`) : 'Unknown video error';
+  showStatus('Preview: ' + msg, 'error');
+});
+
 // --- Playback controls ---
 
 playBtn.addEventListener('click', () => {
