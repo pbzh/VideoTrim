@@ -4,6 +4,7 @@
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -196,6 +197,29 @@ def format_ms(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms_rem:03d}"
 
 
+def _parse_initial_freeze_end(text: str) -> float | None:
+    """Parse ffmpeg freezedetect stderr and return the timestamp (seconds) at
+    which the initial freeze ends — i.e. the moment of the first real frame
+    change.  Returns None when no freeze is detected at the start of the video.
+
+    freezedetect emits lines like:
+        [freezedetect @ 0x...] freeze_start: 0.000000
+        [freezedetect @ 0x...] freeze_duration: 2.167
+        [freezedetect @ 0x...] freeze_end: 2.167
+    """
+    found_zero_start = False
+    for line in text.splitlines():
+        if "freeze_start:" in line:
+            m = re.search(r"freeze_start:\s*([\d.]+)", line)
+            if m and float(m.group(1)) < 0.5:   # freeze begins at or near t=0
+                found_zero_start = True
+        elif "freeze_end:" in line and found_zero_start:
+            m = re.search(r"freeze_end:\s*([\d.]+)", line)
+            if m:
+                return float(m.group(1))
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -211,6 +235,8 @@ class VideoTrimWindow(QMainWindow):
         self.process: QProcess | None = None
         self._process_output: list[bytes] = []   # accumulated ffmpeg output
         self._tmp_path: str | None = None         # temp file used for replace-source trim
+        self._detect_process: QProcess | None = None
+        self._detect_output: list[bytes] = []    # accumulated freezedetect output
         self.video_duration_ms: int = 0
         self.frame_duration_ms: int = 33          # default ~30 fps; updated on load
         self._slider_pressed: bool = False
@@ -338,6 +364,14 @@ class VideoTrimWindow(QMainWindow):
         self.set_start_btn.clicked.connect(self._set_start_from_player)
         row.addWidget(self.set_start_btn)
 
+        self.detect_start_btn = QPushButton("Detect")
+        self.detect_start_btn.setEnabled(False)
+        self.detect_start_btn.setToolTip(
+            "Scan the video for the first frame change and set it as the start point"
+        )
+        self.detect_start_btn.clicked.connect(self._detect_freeze_start)
+        row.addWidget(self.detect_start_btn)
+
         row.addSpacing(20)
 
         row.addWidget(QLabel("End:"))
@@ -437,11 +471,11 @@ class VideoTrimWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        """Kill any in-progress ffmpeg process before closing."""
-        if self.process is not None:
-            if self.process.state() != QProcess.ProcessState.NotRunning:
-                self.process.kill()
-                self.process.waitForFinished(2000)
+        """Kill any in-progress ffmpeg processes before closing."""
+        for proc in (self.process, self._detect_process):
+            if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+                proc.kill()
+                proc.waitForFinished(2000)
         # Remove any leftover temp file from a replace-source trim.
         if self._tmp_path:
             with contextlib.suppress(OSError):
@@ -465,6 +499,80 @@ class VideoTrimWindow(QMainWindow):
             if src:
                 p = Path(src)
                 self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
+
+    # ------------------------------------------------------------------
+    # Freeze-detect start
+    # ------------------------------------------------------------------
+
+    def _detect_freeze_start(self) -> None:
+        """Run ffmpeg freezedetect and set the start time to the first frame change."""
+        input_path = self.file_path.text()
+        if not input_path:
+            return
+
+        self.detect_start_btn.setEnabled(False)
+        self.detect_start_btn.setText("Scanning\u2026")
+        self._detect_output = []
+
+        self._detect_process = QProcess(self)
+        self._detect_process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels
+        )
+        self._detect_process.readyReadStandardOutput.connect(self._on_detect_output)
+        self._detect_process.finished.connect(self._on_detect_finished)
+        self._detect_process.start(
+            FFMPEG,
+            [
+                "-hide_banner",
+                "-i", input_path,
+                "-vf", "freezedetect=n=-60dB:d=0",
+                "-map", "0:v:0",
+                "-f", "null",
+                "-",
+            ],
+        )
+
+    def _on_detect_output(self) -> None:
+        """Buffer freezedetect output; kill early once we have a freeze_end."""
+        if self._detect_process is None:
+            return
+        chunk = self._detect_process.readAllStandardOutput().data()
+        self._detect_output.append(chunk)
+        # If we already found the answer, kill the process — no need to scan further.
+        text = b"".join(self._detect_output).decode(errors="replace")
+        if _parse_initial_freeze_end(text) is not None:
+            self._detect_process.kill()
+
+    def _on_detect_finished(self, _exit_code: int, _exit_status) -> None:
+        """Parse accumulated output and update the start time."""
+        # Drain any bytes that arrived between the last readyRead and finished.
+        if self._detect_process is not None:
+            tail = self._detect_process.readAllStandardOutput().data()
+            if tail:
+                self._detect_output.append(tail)
+
+        self._detect_process = None
+        self.detect_start_btn.setText("Detect")
+        self.detect_start_btn.setEnabled(True)
+
+        text = b"".join(self._detect_output).decode(errors="replace")
+        self._detect_output = []
+
+        freeze_end_s = _parse_initial_freeze_end(text)
+
+        if freeze_end_s is None:
+            self._set_status(
+                "No initial freeze detected \u2014 start left at 0", COLOR_DIM
+            )
+            return
+
+        freeze_end_ms = min(int(freeze_end_s * 1000), self.video_duration_ms)
+        self.start_time.setTime(ms_to_qtime(freeze_end_ms))
+        self._update_duration_label()
+        self._set_status(
+            f"Start set to {format_ms(freeze_end_ms)} (first frame change)",
+            COLOR_SUCCESS,
+        )
 
     # ------------------------------------------------------------------
     # Encoding combo
@@ -572,6 +680,7 @@ class VideoTrimWindow(QMainWindow):
         self.step_fwd_1s_btn.setEnabled(on)
         self.scrub_slider.setEnabled(on)
         self.set_start_btn.setEnabled(on)
+        self.detect_start_btn.setEnabled(on)
         self.set_end_btn.setEnabled(on)
         self.trim_btn.setEnabled(on)
 
