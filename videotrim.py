@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """VideoTrim - Simple video trimmer using ffmpeg."""
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from functools import partial
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGroupBox,
@@ -207,6 +210,7 @@ class VideoTrimWindow(QMainWindow):
         # Runtime state
         self.process: QProcess | None = None
         self._process_output: list[bytes] = []   # accumulated ffmpeg output
+        self._tmp_path: str | None = None         # temp file used for replace-source trim
         self.video_duration_ms: int = 0
         self.frame_duration_ms: int = 33          # default ~30 fps; updated on load
         self._slider_pressed: bool = False
@@ -377,15 +381,24 @@ class VideoTrimWindow(QMainWindow):
 
     def _build_output_group(self) -> QGroupBox:
         group = QGroupBox("Output")
-        row = QHBoxLayout(group)
+        col = QVBoxLayout(group)
 
+        self.replace_source_cb = QCheckBox("Replace source file")
+        self.replace_source_cb.setToolTip(
+            "Trim to a temporary file, then atomically overwrite the original."
+        )
+        self.replace_source_cb.toggled.connect(self._on_replace_source_toggled)
+        col.addWidget(self.replace_source_cb)
+
+        path_row = QHBoxLayout()
         self.output_path = QLineEdit()
         self.output_path.setPlaceholderText("Auto-generated from input filename")
-        row.addWidget(self.output_path, stretch=1)
+        path_row.addWidget(self.output_path, stretch=1)
 
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_output)
-        row.addWidget(browse_btn)
+        self.output_browse_btn = QPushButton("Browse…")
+        self.output_browse_btn.clicked.connect(self._browse_output)
+        path_row.addWidget(self.output_browse_btn)
+        col.addLayout(path_row)
 
         return group
 
@@ -429,7 +442,29 @@ class VideoTrimWindow(QMainWindow):
             if self.process.state() != QProcess.ProcessState.NotRunning:
                 self.process.kill()
                 self.process.waitForFinished(2000)
+        # Remove any leftover temp file from a replace-source trim.
+        if self._tmp_path:
+            with contextlib.suppress(OSError):
+                os.unlink(self._tmp_path)
         event.accept()
+
+    # ------------------------------------------------------------------
+    # Replace-source toggle
+    # ------------------------------------------------------------------
+
+    def _on_replace_source_toggled(self, checked: bool) -> None:
+        self.output_path.setEnabled(not checked)
+        self.output_browse_btn.setEnabled(not checked)
+        if checked:
+            self.output_path.setPlaceholderText("Will overwrite the source file")
+            self.output_path.clear()
+        else:
+            self.output_path.setPlaceholderText("Auto-generated from input filename")
+            # Restore auto-generated path if a source is already loaded.
+            src = self.file_path.text()
+            if src:
+                p = Path(src)
+                self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
 
     # ------------------------------------------------------------------
     # Encoding combo
@@ -498,8 +533,9 @@ class VideoTrimWindow(QMainWindow):
 
         self.player.setSource(QUrl.fromLocalFile(path))
 
-        p = Path(path)
-        self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
+        if not self.replace_source_cb.isChecked():
+            p = Path(path)
+            self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
 
         self._set_controls_enabled(True)
         self.status_label.setText("")
@@ -645,18 +681,10 @@ class VideoTrimWindow(QMainWindow):
 
     def _trim_video(self) -> None:
         input_path = self.file_path.text()
-        output_path = self.output_path.text().strip()
+        replace_source = self.replace_source_cb.isChecked()
 
         if not input_path or not os.path.isfile(input_path):
             QMessageBox.warning(self, "Error", "Please select a valid input file.")
-            return
-
-        if not output_path:
-            QMessageBox.warning(self, "Error", "Please specify an output file path.")
-            return
-
-        if os.path.abspath(input_path) == os.path.abspath(output_path):
-            QMessageBox.warning(self, "Error", "Output file cannot be the same as input file.")
             return
 
         start_ms = qtime_to_ms(self.start_time.time())
@@ -666,15 +694,46 @@ class VideoTrimWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "End time must be after start time.")
             return
 
-        if os.path.exists(output_path):
+        if replace_source:
             reply = QMessageBox.question(
                 self,
-                "File Exists",
-                f"'{Path(output_path).name}' already exists. Overwrite?",
+                "Replace Source File",
+                f"This will permanently overwrite '{Path(input_path).name}' "
+                f"with the trimmed version.\n\nContinue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+            # Trim to a temp file in the same directory so os.replace() is
+            # guaranteed to be on the same filesystem (atomic rename).
+            ext = Path(input_path).suffix
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=ext, dir=str(Path(input_path).parent)
+            )
+            os.close(fd)
+            self._tmp_path = tmp_path
+            effective_output = tmp_path
+        else:
+            output_path = self.output_path.text().strip()
+            if not output_path:
+                QMessageBox.warning(self, "Error", "Please specify an output file path.")
+                return
+            if os.path.abspath(input_path) == os.path.abspath(output_path):
+                QMessageBox.warning(
+                    self, "Error", "Output file cannot be the same as input file."
+                )
+                return
+            if os.path.exists(output_path):
+                reply = QMessageBox.question(
+                    self,
+                    "File Exists",
+                    f"'{Path(output_path).name}' already exists. Overwrite?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            self._tmp_path = None
+            effective_output = output_path
 
         self.player.pause()
 
@@ -692,7 +751,7 @@ class VideoTrimWindow(QMainWindow):
                 "-c", "copy",
                 "-map", "0",
                 "-avoid_negative_ts", "make_zero",
-                output_path,
+                effective_output,
             ]
         else:
             # Output seeking: frame-accurate re-encode.
@@ -724,7 +783,7 @@ class VideoTrimWindow(QMainWindow):
                 "-c:a", "aac",
                 "-map", "0",
                 "-avoid_negative_ts", "make_zero",
-                output_path,
+                effective_output,
             ]
 
         self.trim_btn.setEnabled(False)
@@ -753,27 +812,78 @@ class VideoTrimWindow(QMainWindow):
         self.progress.setVisible(False)
         self.trim_btn.setEnabled(True)
 
+        tmp_path = self._tmp_path
+        self._tmp_path = None
+        self.process = None
+        self._process_output_buf = b"".join(self._process_output)
+        self._process_output = []
+
+        if tmp_path is not None:
+            # Replace-source mode: move the temp file over the original.
+            self._finish_replace_source(exit_code, tmp_path)
+        else:
+            self._finish_normal(exit_code)
+
+    def _finish_replace_source(self, exit_code: int, tmp_path: str) -> None:
+        """Handle process completion when the replace-source option was used."""
+        input_path = self.file_path.text()
+
+        if exit_code != 0:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            tail = self._ffmpeg_tail()
+            self._set_status(f"ffmpeg failed (exit code {exit_code})", COLOR_ERROR)
+            QMessageBox.critical(self, "ffmpeg Error", tail)
+            return
+
+        if not os.path.isfile(tmp_path):
+            self._set_status(
+                "ffmpeg reported success but temp file was not created.", COLOR_ERROR
+            )
+            return
+
+        try:
+            os.replace(tmp_path, input_path)   # atomic on same filesystem
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            self._set_status(
+                f"Trim succeeded but could not replace source: {exc}", COLOR_ERROR
+            )
+            return
+
+        size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        self._set_status(
+            f"Done! Replaced ({size_mb:.1f} MB): {input_path}", COLOR_SUCCESS
+        )
+
+        # Reload the player so scrub bar and duration reflect the trimmed file.
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.player.setSource(QUrl.fromLocalFile(input_path))
+
+    def _finish_normal(self, exit_code: int) -> None:
+        """Handle process completion for a normal (new-file) trim."""
         output_path = self.output_path.text()
 
         if exit_code == 0 and os.path.isfile(output_path):
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             self._set_status(
-                f"Done! Saved ({size_mb:.1f} MB): {output_path}",
-                COLOR_SUCCESS,
+                f"Done! Saved ({size_mb:.1f} MB): {output_path}", COLOR_SUCCESS
             )
         elif exit_code == 0:
             self._set_status(
-                "ffmpeg reported success but output file was not created.",
-                COLOR_ERROR,
+                "ffmpeg reported success but output file was not created.", COLOR_ERROR
             )
         else:
-            full_output = b"".join(self._process_output).decode(errors="replace")
-            tail = full_output[-2000:] if len(full_output) > 2000 else full_output
+            tail = self._ffmpeg_tail()
             self._set_status(f"ffmpeg failed (exit code {exit_code})", COLOR_ERROR)
             QMessageBox.critical(self, "ffmpeg Error", tail)
 
-        self.process = None
-        self._process_output = []
+    def _ffmpeg_tail(self) -> str:
+        """Return the last 2000 chars of the accumulated ffmpeg output."""
+        full = self._process_output_buf.decode(errors="replace")
+        return full[-2000:] if len(full) > 2000 else full
 
     # ------------------------------------------------------------------
     # Status helper
