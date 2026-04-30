@@ -12,17 +12,21 @@ from functools import partial
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, QTime, Qt, QUrl
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -221,6 +225,383 @@ def _parse_initial_freeze_end(text: str) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Bulk processing dialog
+# ---------------------------------------------------------------------------
+
+
+class BulkDialog(QDialog):
+    """Trim a list of video files in sequence.
+
+    For each file the dialog:
+      1. Runs ffmpeg freezedetect to find the first real frame change.
+      2. Trims from that timestamp to the end of the file.
+      3. Saves as ``<name>_trimmed.<ext>`` or replaces the source file,
+         depending on the *replace_source* flag inherited from the main window.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget,
+        encoder_name: str,
+        replace_source: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Trim")
+        self.setMinimumSize(620, 420)
+
+        self._encoder_name = encoder_name
+        self._replace_source = replace_source
+
+        # Per-file state (parallel lists)
+        self._files: list[str] = []
+        self._statuses: list[str] = []
+
+        # Processing state
+        self._running = False
+        self._current_idx = 0
+        self._detect_process: QProcess | None = None
+        self._detect_output: list[bytes] = []
+        self._trim_process: QProcess | None = None
+        self._trim_output: list[bytes] = []
+        self._tmp_path: str | None = None
+        self._current_start_ms: int = 0
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection
+        )
+        layout.addWidget(self.list_widget, stretch=1)
+
+        file_row = QHBoxLayout()
+        self.add_btn = QPushButton("Add Files\u2026")
+        self.add_btn.clicked.connect(self._add_files)
+        file_row.addWidget(self.add_btn)
+
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self._remove_selected)
+        file_row.addWidget(self.remove_btn)
+
+        file_row.addStretch()
+        layout.addLayout(file_row)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet(COLOR_DIM)
+        layout.addWidget(self.status_label)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+
+        self.process_btn = QPushButton("Process All")
+        self.process_btn.setDefault(True)
+        self.process_btn.clicked.connect(self._start_processing)
+        action_row.addWidget(self.process_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_processing)
+        action_row.addWidget(self.stop_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        action_row.addWidget(close_btn)
+
+        layout.addLayout(action_row)
+
+    # ------------------------------------------------------------------
+    # File list helpers
+    # ------------------------------------------------------------------
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add Video Files", "", SUPPORTED_FORMATS
+        )
+        for path in paths:
+            if path not in self._files:
+                self._files.append(path)
+                self._statuses.append("Pending")
+                self.list_widget.addItem(self._make_item(len(self._files) - 1))
+
+    def _remove_selected(self) -> None:
+        if self._running:
+            return
+        rows = sorted(
+            {self.list_widget.row(i) for i in self.list_widget.selectedItems()},
+            reverse=True,
+        )
+        for row in rows:
+            self.list_widget.takeItem(row)
+            self._files.pop(row)
+            self._statuses.pop(row)
+
+    def _make_item(self, idx: int) -> QListWidgetItem:
+        item = QListWidgetItem(self._item_text(idx))
+        self._colour_item(item, self._statuses[idx])
+        return item
+
+    def _update_item(self, idx: int, status: str) -> None:
+        self._statuses[idx] = status
+        item = self.list_widget.item(idx)
+        if item is None:
+            return
+        item.setText(self._item_text(idx))
+        self._colour_item(item, status)
+
+    def _item_text(self, idx: int) -> str:
+        return f"  {Path(self._files[idx]).name}  \u2014  {self._statuses[idx]}"
+
+    @staticmethod
+    def _colour_item(item: QListWidgetItem, status: str) -> None:
+        if status.startswith("Done"):
+            item.setForeground(QBrush(QColor("#4ec994")))
+        elif status.startswith("Error"):
+            item.setForeground(QBrush(QColor("#f14c4c")))
+        else:
+            item.setForeground(QBrush(QColor("#cccccc")))
+
+    # ------------------------------------------------------------------
+    # Processing pipeline
+    # ------------------------------------------------------------------
+
+    def _start_processing(self) -> None:
+        if not self._files:
+            self.status_label.setText("No files added.")
+            return
+
+        self._running = True
+        self.process_btn.setEnabled(False)
+        self.add_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress.setRange(0, len(self._files))
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+        self.status_label.setStyleSheet(COLOR_DIM)
+        self.status_label.setText("")
+
+        for i in range(len(self._files)):
+            if not self._statuses[i].startswith("Done"):
+                self._update_item(i, "Pending")
+
+        self._current_idx = 0
+        self._process_next()
+
+    def _process_next(self) -> None:
+        while (
+            self._current_idx < len(self._files)
+            and self._statuses[self._current_idx].startswith("Done")
+        ):
+            self._current_idx += 1
+
+        if self._current_idx >= len(self._files):
+            self._finish_all()
+            return
+
+        self._run_detect()
+
+    def _run_detect(self) -> None:
+        path = self._files[self._current_idx]
+        self._update_item(self._current_idx, "Detecting\u2026")
+        self._detect_output = []
+
+        self._detect_process = QProcess(self)
+        self._detect_process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels
+        )
+        self._detect_process.readyReadStandardOutput.connect(self._on_detect_output)
+        self._detect_process.finished.connect(self._on_detect_finished)
+        self._detect_process.start(
+            FFMPEG,
+            [
+                "-hide_banner",
+                "-i", path,
+                "-vf", "freezedetect=n=-40dB:d=0",
+                "-map", "0:v:0",
+                "-f", "null",
+                "-",
+            ],
+        )
+
+    def _on_detect_output(self) -> None:
+        if self._detect_process is None:
+            return
+        chunk = self._detect_process.readAllStandardOutput().data()
+        self._detect_output.append(chunk)
+        text = b"".join(self._detect_output).decode(errors="replace")
+        if _parse_initial_freeze_end(text) is not None:
+            self._detect_process.kill()
+
+    def _on_detect_finished(self, _exit_code: int, _exit_status) -> None:
+        if self._detect_process is not None:
+            tail = self._detect_process.readAllStandardOutput().data()
+            if tail:
+                self._detect_output.append(tail)
+        self._detect_process = None
+
+        text = b"".join(self._detect_output).decode(errors="replace")
+        self._detect_output = []
+
+        freeze_end_s = _parse_initial_freeze_end(text)
+        self._current_start_ms = (
+            int(freeze_end_s * 1000) if freeze_end_s is not None else 0
+        )
+
+        if self._running:
+            self._run_trim()
+
+    def _run_trim(self) -> None:
+        idx = self._current_idx
+        path = self._files[idx]
+        start = format_ms(self._current_start_ms)  # HH:MM:SS.mmm — accepted by ffmpeg
+
+        if self._replace_source:
+            ext = Path(path).suffix
+            fd, tmp = tempfile.mkstemp(suffix=ext, dir=str(Path(path).parent))
+            os.close(fd)
+            self._tmp_path = tmp
+            output = tmp
+        else:
+            self._tmp_path = None
+            output = str(Path(path).with_stem(Path(path).stem + "_trimmed"))
+
+        self._update_item(idx, f"Trimming from {start}\u2026")
+
+        enc = self._encoder_name
+        if enc == "copy":
+            cmd = [
+                FFMPEG, "-y",
+                "-ss", start,
+                "-i", path,
+                "-c", "copy",
+                "-map", "0",
+                "-avoid_negative_ts", "make_zero",
+                output,
+            ]
+        else:
+            quality_args: list[str] = []
+            if "videotoolbox" in enc:
+                quality_args = ["-q:v", "65"]
+            elif "qsv" in enc:
+                quality_args = ["-global_quality", "18"]
+            cmd = [
+                FFMPEG, "-y",
+                "-i", path,
+                "-ss", start,
+                "-c:v", enc,
+                *quality_args,
+                "-c:a", "aac",
+                "-map", "0",
+                "-avoid_negative_ts", "make_zero",
+                output,
+            ]
+
+        self._trim_output = []
+        self._trim_process = QProcess(self)
+        self._trim_process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels
+        )
+        self._trim_process.readyReadStandardOutput.connect(self._on_trim_output)
+        self._trim_process.finished.connect(self._on_trim_finished)
+        self._trim_process.start(cmd[0], cmd[1:])
+
+    def _on_trim_output(self) -> None:
+        if self._trim_process is not None:
+            self._trim_output.append(
+                self._trim_process.readAllStandardOutput().data()
+            )
+
+    def _on_trim_finished(self, exit_code: int, _exit_status) -> None:
+        if self._trim_process is not None:
+            tail = self._trim_process.readAllStandardOutput().data()
+            if tail:
+                self._trim_output.append(tail)
+        self._trim_process = None
+
+        idx = self._current_idx
+        path = self._files[idx]
+        tmp, self._tmp_path = self._tmp_path, None
+
+        if exit_code != 0:
+            with contextlib.suppress(OSError):
+                if tmp:
+                    os.unlink(tmp)
+            self._update_item(idx, "Error \u2014 ffmpeg failed")
+        elif self._replace_source and tmp:
+            try:
+                os.replace(tmp, path)
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+                self._update_item(idx, f"Done \u2014 replaced ({size_mb:.1f}\u00a0MB)")
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                self._update_item(idx, f"Error \u2014 {exc}")
+        else:
+            out = str(Path(path).with_stem(Path(path).stem + "_trimmed"))
+            if os.path.isfile(out):
+                size_mb = os.path.getsize(out) / (1024 * 1024)
+                self._update_item(idx, f"Done ({size_mb:.1f}\u00a0MB)")
+            else:
+                self._update_item(idx, "Error \u2014 output not created")
+
+        self._current_idx += 1
+        self.progress.setValue(self._current_idx)
+
+        if self._running:
+            self._process_next()
+
+    def _stop_processing(self) -> None:
+        self._running = False
+        for proc in (self._detect_process, self._trim_process):
+            if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+                proc.kill()
+                proc.waitForFinished(2000)
+        if self._tmp_path:
+            with contextlib.suppress(OSError):
+                os.unlink(self._tmp_path)
+            self._tmp_path = None
+        self._finish_all(stopped=True)
+
+    def _finish_all(self, stopped: bool = False) -> None:
+        self._running = False
+        self.process_btn.setEnabled(True)
+        self.add_btn.setEnabled(True)
+        self.remove_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress.setVisible(False)
+
+        done_n = sum(1 for s in self._statuses if s.startswith("Done"))
+        err_n = sum(1 for s in self._statuses if s.startswith("Error"))
+        msg = (
+            f"Stopped \u2014 {done_n} done, {err_n} failed."
+            if stopped
+            else f"Finished \u2014 {done_n} succeeded, {err_n} failed."
+        )
+        self.status_label.setText(msg)
+        self.status_label.setStyleSheet(COLOR_ERROR if err_n else COLOR_SUCCESS)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._stop_processing()
+        event.accept()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -287,6 +668,11 @@ class VideoTrimWindow(QMainWindow):
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_file)
         row.addWidget(browse_btn)
+
+        bulk_btn = QPushButton("Bulk…")
+        bulk_btn.setToolTip("Batch-trim multiple files using the current encoding settings")
+        bulk_btn.clicked.connect(self._open_bulk_dialog)
+        row.addWidget(bulk_btn)
 
         return group
 
@@ -483,6 +869,28 @@ class VideoTrimWindow(QMainWindow):
         event.accept()
 
     # ------------------------------------------------------------------
+    # Bulk dialog
+    # ------------------------------------------------------------------
+
+    def _current_encoder_name(self) -> str:
+        """Return the raw ffmpeg encoder name for the current combo selection."""
+        text = self.encoding_combo.currentText()
+        if text == ENCODING_STREAM_COPY:
+            return "copy"
+        for _label, enc, _hint in self._available_hw_encoders:
+            if text == _label:
+                return enc
+        return "copy"
+
+    def _open_bulk_dialog(self) -> None:
+        dlg = BulkDialog(
+            self,
+            encoder_name=self._current_encoder_name(),
+            replace_source=self.replace_source_cb.isChecked(),
+        )
+        dlg.exec()
+
+    # ------------------------------------------------------------------
     # Replace-source toggle
     # ------------------------------------------------------------------
 
@@ -525,7 +933,7 @@ class VideoTrimWindow(QMainWindow):
             [
                 "-hide_banner",
                 "-i", input_path,
-                "-vf", "freezedetect=n=-60dB:d=0",
+                "-vf", "freezedetect=n=-40dB:d=0",
                 "-map", "0:v:0",
                 "-f", "null",
                 "-",
