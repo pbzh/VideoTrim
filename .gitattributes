@@ -1,0 +1,19 @@
+# Enforce LF line endings in the repository for all text files.
+# Git will normalise to LF on commit and leave line endings as-is on checkout
+# (eol=lf), keeping the working tree clean on both Windows and macOS/Linux.
+
+* text=auto eol=lf
+
+# Explicitly binary — never touch line endings
+*.exe  binary
+*.dll  binary
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+
+# Windows scripts use CRLF so they work when opened in Notepad etc.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
