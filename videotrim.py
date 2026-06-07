@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, QTime, Qt, QUrl
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtGui import QBrush, QColor, QIcon
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -76,7 +76,36 @@ HW_ENCODERS = [
         "av1_qsv",
         "Hardware-accelerated AV1 via Intel Quick Sync — best compression",
     ),
+    (
+        "H.264 (AMD AMF)",
+        "h264_amf",
+        "Hardware-accelerated H.264 via AMD AMF",
+    ),
+    (
+        "HEVC (AMD AMF)",
+        "hevc_amf",
+        "Hardware-accelerated HEVC via AMD AMF — smaller files",
+    ),
+    (
+        "AV1 (AMD AMF)",
+        "av1_amf",
+        "Hardware-accelerated AV1 via AMD AMF — best compression",
+    ),
 ]
+
+
+def _encoder_quality_args(enc: str) -> list[str]:
+    """Return ffmpeg quality flags for a hardware encoder name.
+
+    Each vendor uses a different rate-control knob for constant quality.
+    """
+    if "videotoolbox" in enc:
+        return ["-q:v", "65"]
+    if "qsv" in enc:
+        return ["-global_quality", "18"]
+    if "amf" in enc:
+        return ["-rc", "cqp", "-qp_i", "18", "-qp_p", "18"]
+    return []
 
 # UI colours — defined centrally so theme changes are a one-liner.
 COLOR_DIM = "color: #888888;"
@@ -130,6 +159,31 @@ def _find_tool(name: str) -> str:
 
 FFMPEG = _find_tool("ffmpeg")
 FFPROBE = _find_tool("ffprobe")
+
+
+def _icon_path() -> str:
+    """Return the path to the app icon (icon.png), or "" if not found.
+
+    Checks the PyInstaller bundle root when frozen, otherwise the assets/
+    dir beside this script during development.
+    """
+    names = ("icon.png", "icon.ico")
+    bases: list[Path] = []
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
+        bases += [base, base / "_internal"]
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bases.append(Path(meipass))
+    else:
+        bases.append(Path(__file__).resolve().parent / "assets")
+
+    for b in bases:
+        for n in names:
+            c = b / n
+            if c.is_file():
+                return str(c)
+    return ""
 
 
 def _probe_available_hw_encoders() -> list[tuple[str, str, str]]:
@@ -491,11 +545,7 @@ class BulkDialog(QDialog):
                 output,
             ]
         else:
-            quality_args: list[str] = []
-            if "videotoolbox" in enc:
-                quality_args = ["-q:v", "65"]
-            elif "qsv" in enc:
-                quality_args = ["-global_quality", "18"]
+            quality_args = _encoder_quality_args(enc)
             cmd = [
                 FFMPEG, "-y",
                 "-i", path,
@@ -1284,11 +1334,7 @@ class VideoTrimWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "Unknown encoder mode selected.")
                 return
 
-            quality_args: list[str] = []
-            if "videotoolbox" in video_codec:
-                quality_args = ["-q:v", "65"]
-            elif "qsv" in video_codec:
-                quality_args = ["-global_quality", "18"]
+            quality_args = _encoder_quality_args(video_codec)
 
             cmd = [
                 FFMPEG, "-y",
@@ -1419,6 +1465,9 @@ class VideoTrimWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("VideoTrim")
+    icon_path = _icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     window = VideoTrimWindow()
     window.show()
     sys.exit(app.exec())

@@ -44,8 +44,11 @@ python -m PyInstaller `
     --distpath $distPath `
     --workpath $workPath `
     --specpath "build\windows-python" `
+    --icon "assets\icon.ico" `
     --add-binary "${ffmpeg};ffmpeg" `
     --add-binary "${ffprobe};ffmpeg" `
+    --add-data "assets\icon.png;." `
+    --add-data "assets\icon.ico;." `
     videotrim.py
 
 Write-Host ""
