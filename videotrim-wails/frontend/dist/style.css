@@ -258,3 +258,72 @@ label { color: var(--dim); white-space: nowrap; }
 }
 .status-label.success { color: var(--success); }
 .status-label.error   { color: var(--error); }
+
+/* Folder freeze scan */
+.num-input {
+  width: 56px;
+  padding: 5px 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  text-align: center;
+}
+.num-input:focus { border-color: var(--accent); }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  width: min(720px, 92vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.scan-results {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.scan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.scan-table th, .scan-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.scan-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg3);
+  color: var(--dim);
+  font-weight: 600;
+}
+.scan-table td.scan-file { white-space: normal; word-break: break-all; }
+.scan-clickable { cursor: pointer; }
+.scan-clickable:hover { background: var(--bg3); }
+.scan-frozen td:nth-child(2) { color: var(--success); font-weight: 600; }
+.scan-err td { color: var(--error); }

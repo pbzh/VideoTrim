@@ -16,6 +16,28 @@ export namespace main {
 	        this.hint = source["hint"];
 	    }
 	}
+	export class ScanRow {
+	    file: string;
+	    path: string;
+	    frozenIntro: boolean;
+	    firstChange: string;
+	    freezeSec: number;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ScanRow(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.file = source["file"];
+	        this.path = source["path"];
+	        this.frozenIntro = source["frozenIntro"];
+	        this.firstChange = source["firstChange"];
+	        this.freezeSec = source["freezeSec"];
+	        this.error = source["error"];
+	    }
+	}
 	export class TrimParams {
 	    inputPath: string;
 	    outputPath: string;

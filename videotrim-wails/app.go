@@ -68,6 +68,16 @@ type TrimResult struct {
 	FileSizeMB float64 `json:"fileSizeMB,omitempty"`
 }
 
+// ScanRow is one file's result from a folder freeze scan.
+type ScanRow struct {
+	File        string  `json:"file"`        // base name
+	Path        string  `json:"path"`        // absolute path
+	FrozenIntro bool    `json:"frozenIntro"` // starts with a frozen/static section
+	FirstChange string  `json:"firstChange"` // HH:MM:SS.mmm of first frame change ("" if none)
+	FreezeSec   float64 `json:"freezeSec"`   // length of the initial freeze in seconds
+	Error       string  `json:"error,omitempty"`
+}
+
 // --- Helpers ---
 
 var extraPaths = []string{
@@ -208,6 +218,31 @@ func smartFallbackEncoder() string {
 	return "libx264"
 }
 
+// videoExts is the set of file extensions treated as scannable videos.
+var videoExts = map[string]bool{
+	".mp4": true, ".mkv": true, ".avi": true, ".mov": true, ".ts": true,
+	".flv": true, ".wmv": true, ".webm": true, ".m4v": true, ".mpg": true,
+	".mpeg": true, ".3gp": true,
+}
+
+// parseInitialFreeze reports whether the video starts frozen (a freeze_start
+// at/near t=0), and if so the timestamp where that freeze ends.
+func parseInitialFreeze(text string) (frozen bool, end float64, hasEnd bool) {
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case strings.Contains(line, "freeze_start:"):
+			if v, ok := lastFloatAfter(line, "freeze_start:"); ok && v < 0.5 {
+				frozen = true
+			}
+		case strings.Contains(line, "freeze_end:") && frozen && !hasEnd:
+			if v, ok := lastFloatAfter(line, "freeze_end:"); ok {
+				end, hasEnd = v, true
+			}
+		}
+	}
+	return
+}
+
 // parseInitialFreezeEnd scans ffmpeg freezedetect output and returns the
 // timestamp (seconds) where an initial freeze ends — the moment of the first
 // real frame change. Returns -1 when the video does not start frozen.
@@ -295,6 +330,117 @@ func (a *App) DetectFirstChange(path string) string {
 	}
 	_ = cmd.Wait() // reap the process (killed or finished)
 	return result
+}
+
+// SelectFolder shows a directory-picker dialog and returns the chosen path.
+func (a *App) SelectFolder() string {
+	dir, err := wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
+		Title: "Select Folder to Scan",
+	})
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// scanFreeze runs freezedetect over the first windowSec seconds of a file and
+// returns the row describing its initial-freeze state.
+func scanFreeze(path string, windowSec float64) ScanRow {
+	row := ScanRow{File: filepath.Base(path), Path: path}
+	// -t limits decoding to the window, so each file costs ~windowSec of decode.
+	cmd := exec.Command(ffmpegBin(),
+		"-hide_banner",
+		"-i", path,
+		"-t", strconv.FormatFloat(windowSec, 'f', 3, 64),
+		"-vf", "freezedetect=n=-40dB:d=0",
+		"-map", "0:v:0",
+		"-an",
+		"-f", "null", "-",
+	)
+	out, err := cmd.CombinedOutput()
+	text := string(out)
+	if err != nil && !strings.Contains(text, "freeze") {
+		// A real failure (bad file, no video stream) — surface a short reason.
+		row.Error = "probe failed"
+		return row
+	}
+	frozen, end, hasEnd := parseInitialFreeze(text)
+	if !frozen {
+		return row // no frozen intro
+	}
+	row.FrozenIntro = true
+	if hasEnd {
+		row.FreezeSec = end
+		row.FirstChange = secondsToTime(end)
+	} else {
+		// Frozen for the entire scanned window — first change is beyond it.
+		row.FreezeSec = windowSec
+		row.FirstChange = ">" + secondsToTime(windowSec)
+	}
+	return row
+}
+
+// ScanFolder scans every video file in dir for a frozen/static intro within the
+// first windowSec seconds and returns one row per file. Files are scanned
+// concurrently; progress is emitted via the "scan:progress" event.
+func (a *App) ScanFolder(dir string, windowSec float64) []ScanRow {
+	if dir == "" {
+		return nil
+	}
+	if windowSec <= 0 {
+		windowSec = 10
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if videoExts[strings.ToLower(filepath.Ext(e.Name()))] {
+			paths = append(paths, filepath.Join(dir, e.Name()))
+		}
+	}
+
+	rows := make([]ScanRow, len(paths))
+	total := len(paths)
+	if total == 0 {
+		return rows
+	}
+
+	// Bounded worker pool — freezedetect is CPU-bound on decode.
+	workers := runtime.NumCPU()
+	if workers > 6 {
+		workers = 6
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	var doneMu sync.Mutex
+	done := 0
+	sem := make(chan struct{}, workers)
+
+	for i, p := range paths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, path string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rows[idx] = scanFreeze(path, windowSec)
+			doneMu.Lock()
+			done++
+			d := done
+			doneMu.Unlock()
+			wailsruntime.EventsEmit(a.ctx, "scan:progress", map[string]int{"done": d, "total": total})
+		}(i, p)
+	}
+	wg.Wait()
+	return rows
 }
 
 // secondsToTime formats seconds as HH:MM:SS.mmm.

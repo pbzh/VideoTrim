@@ -18,4 +18,8 @@ export function OpenVideoFile():Promise<string>;
 
 export function SaveOutputFile(arg1:string):Promise<string>;
 
+export function ScanFolder(arg1:string,arg2:number):Promise<Array<main.ScanRow>>;
+
+export function SelectFolder():Promise<string>;
+
 export function TrimVideo(arg1:main.TrimParams):Promise<main.TrimResult>;

@@ -92,6 +92,36 @@
     <!-- Status -->
     <div id="status-label" class="status-label"></div>
 
+    <!-- Folder freeze scan -->
+    <div class="group">
+      <div class="group-title">Folder Freeze Scan</div>
+      <div class="row">
+        <button id="scan-folder-btn" class="btn">Scan Folder…</button>
+        <label>First</label>
+        <input type="number" id="scan-window" class="num-input" value="10" min="1" max="120" step="1" />
+        <label>sec</label>
+        <span id="scan-status" class="info-text"></span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Scan results modal -->
+  <div id="scan-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="scan-modal-title" class="group-title">Folder Freeze Scan</span>
+        <button id="scan-close-btn" class="btn btn-sm">Close</button>
+      </div>
+      <div class="scan-results">
+        <table class="scan-table">
+          <thead>
+            <tr><th>File</th><th>Frozen intro</th><th>First change</th><th>Freeze (s)</th></tr>
+          </thead>
+          <tbody id="scan-tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
   <script src="main.js"></script>
 </body>

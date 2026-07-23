@@ -411,5 +411,95 @@ function showStatus(msg, type) {
   statusLabel.className = 'status-label' + (type ? ' ' + type : '');
 }
 
+// --- Folder freeze scan ---
+
+const scanFolderBtn = el('scan-folder-btn');
+const scanWindow    = el('scan-window');
+const scanStatus    = el('scan-status');
+const scanTbody     = el('scan-tbody');
+const scanModal     = el('scan-modal');
+const scanModalTitle = el('scan-modal-title');
+const scanCloseBtn  = el('scan-close-btn');
+
+scanCloseBtn.addEventListener('click', () => scanModal.classList.add('hidden'));
+scanModal.addEventListener('click', e => { if (e.target === scanModal) scanModal.classList.add('hidden'); });
+
+// Live progress from the Go scanner.
+if (window.runtime && window.runtime.EventsOn) {
+  window.runtime.EventsOn('scan:progress', p => {
+    if (p && p.total) scanStatus.textContent = `Scanning… ${p.done}/${p.total}`;
+  });
+}
+
+scanFolderBtn.addEventListener('click', async () => {
+  const dir = await go.SelectFolder();
+  if (!dir) return;
+
+  const win = Math.max(1, parseFloat(scanWindow.value) || 10);
+  scanFolderBtn.disabled = true;
+  scanStatus.textContent = 'Scanning…';
+  scanTbody.innerHTML = '';
+
+  try {
+    const rows = await go.ScanFolder(dir, win);
+    renderScan(rows, win);
+  } catch (e) {
+    scanStatus.textContent = 'Scan failed: ' + String(e);
+  } finally {
+    scanFolderBtn.disabled = false;
+  }
+});
+
+function renderScan(rows, win) {
+  scanTbody.innerHTML = '';
+  if (!rows || rows.length === 0) {
+    scanStatus.textContent = 'No video files found in that folder.';
+    scanModal.classList.add('hidden');
+    return;
+  }
+
+  // Frozen intros first, longest freeze first.
+  rows.sort((a, b) => (b.frozenIntro - a.frozenIntro) || (b.freezeSec - a.freezeSec));
+
+  let frozenCount = 0;
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    tr.className = 'scan-clickable' + (r.error ? ' scan-err' : (r.frozenIntro ? ' scan-frozen' : ''));
+    tr.title = 'Click to open this file in the trimmer';
+
+    const frozenCell = r.error ? '—' : (r.frozenIntro ? 'Yes' : 'No');
+    const change     = r.error ? r.error : (r.firstChange || '—');
+    const secs       = r.error ? '—' : (r.frozenIntro ? r.freezeSec.toFixed(2) : '0.00');
+    if (r.frozenIntro && !r.error) frozenCount++;
+
+    tr.innerHTML =
+      `<td class="scan-file">${escapeHtml(r.file)}</td>` +
+      `<td>${frozenCell}</td><td>${escapeHtml(change)}</td><td>${secs}</td>`;
+
+    // Clicking a row loads it into the trimmer and presets the detected start.
+    tr.addEventListener('click', async () => {
+      scanModal.classList.add('hidden');
+      await loadVideo(r.path);
+      if (r.frozenIntro && r.firstChange && !r.firstChange.startsWith('>')) {
+        startTimeIn.value = r.firstChange;
+        validateTimeInputs();
+        updateDurationLabel();
+      }
+      showStatus('Loaded ' + r.file, 'success');
+    });
+    scanTbody.appendChild(tr);
+  }
+
+  const summary = `${rows.length} file(s) — ${frozenCount} with a frozen intro (first ${win}s)`;
+  scanModalTitle.textContent = 'Folder Freeze Scan — ' + summary;
+  scanStatus.textContent = summary + '.';
+  scanModal.classList.remove('hidden');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 // --- Boot ---
 initEncoders();

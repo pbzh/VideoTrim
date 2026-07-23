@@ -34,6 +34,14 @@ export function SaveOutputFile(arg1) {
   return window['go']['main']['App']['SaveOutputFile'](arg1);
 }
 
+export function ScanFolder(arg1, arg2) {
+  return window['go']['main']['App']['ScanFolder'](arg1, arg2);
+}
+
+export function SelectFolder() {
+  return window['go']['main']['App']['SelectFolder']();
+}
+
 export function TrimVideo(arg1) {
   return window['go']['main']['App']['TrimVideo'](arg1);
 }
