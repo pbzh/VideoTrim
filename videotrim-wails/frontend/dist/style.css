@@ -271,6 +271,7 @@ label { color: var(--dim); white-space: nowrap; }
 }
 .num-input:focus { border-color: var(--accent); }
 
+.modal-overlay.hidden { display: none; }
 .modal-overlay {
   position: fixed;
   inset: 0;
