@@ -68,26 +68,142 @@ type TrimResult struct {
 
 // --- Helpers ---
 
-func ffmpegBin() string {
-	if runtime.GOOS == "windows" {
-		return "ffmpeg.exe"
-	}
-	return "ffmpeg"
+var extraPaths = []string{
+	"/opt/homebrew/bin",
+	"/usr/local/bin",
+	"/usr/bin",
 }
 
-func ffprobeBin() string {
-	if runtime.GOOS == "windows" {
-		return "ffprobe.exe"
+func resolveBin(name string) string {
+	// Prefer a copy bundled next to our own executable (self-contained app).
+	if exe, err := os.Executable(); err == nil {
+		full := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(full); err == nil {
+			return full
+		}
 	}
-	return "ffprobe"
+	if path, err := exec.LookPath(name); err == nil {
+		return path
+	}
+	for _, dir := range extraPaths {
+		full := filepath.Join(dir, name)
+		if _, err := os.Stat(full); err == nil {
+			return full
+		}
+	}
+	return name
 }
+
+func binName(base string) string {
+	if runtime.GOOS == "windows" {
+		return base + ".exe"
+	}
+	return base
+}
+
+func ffmpegBin() string  { return resolveBin(binName("ffmpeg")) }
+func ffprobeBin() string { return resolveBin(binName("ffprobe")) }
 
 var allHWEncoders = []EncoderInfo{
 	{"H.264 (Apple VideoToolbox)", "h264_videotoolbox", "Hardware-accelerated H.264 — frame-accurate, fast"},
 	{"HEVC (Apple VideoToolbox)", "hevc_videotoolbox", "Hardware-accelerated HEVC — frame-accurate, smaller files"},
+	{"H.264 (AMD AMF)", "h264_amf", "Hardware-accelerated H.264 via AMD (Windows)"},
+	{"HEVC (AMD AMF)", "hevc_amf", "Hardware-accelerated HEVC via AMD (Windows) — smaller files"},
+	{"AV1 (AMD AMF)", "av1_amf", "Hardware-accelerated AV1 via AMD RDNA3+ (Windows) — best compression"},
 	{"H.264 (Intel QSV)", "h264_qsv", "Hardware-accelerated H.264 via Intel Quick Sync"},
 	{"HEVC (Intel QSV)", "hevc_qsv", "Hardware-accelerated HEVC via Intel Quick Sync"},
 	{"AV1 (Intel QSV)", "av1_qsv", "Hardware-accelerated AV1 via Intel Quick Sync — best compression"},
+}
+
+// qualityArgsFor returns near-lossless CQP-style quality args for a given
+// hardware encoder, minimizing quality degradation on re-encode.
+func qualityArgsFor(encoder string) []string {
+	switch {
+	case strings.Contains(encoder, "videotoolbox"):
+		// VideoToolbox -q:v is 1-100, higher = better. 80 ≈ visually lossless.
+		return []string{"-q:v", "80"}
+	case strings.Contains(encoder, "amf"):
+		// AMD AMF: constant-QP, lower = better. qp 16 ≈ near-lossless.
+		// No -qp_b: av1_amf has no B-frames and would reject it.
+		return []string{"-rc", "cqp", "-qp_i", "16", "-qp_p", "16", "-quality", "quality"}
+	case strings.Contains(encoder, "qsv"):
+		// Intel QSV: ICQ global_quality, lower = better. 16 ≈ near-lossless.
+		return []string{"-global_quality", "16"}
+	case strings.Contains(encoder, "libx26"):
+		// Software x264/x265: CRF, lower = better. 16 ≈ near-lossless.
+		return []string{"-crf", "16", "-preset", "medium"}
+	}
+	return nil
+}
+
+// timeToSeconds parses an HH:MM:SS.mmm (or SS.mmm) string into seconds.
+func timeToSeconds(t string) (float64, bool) {
+	parts := strings.Split(strings.TrimSpace(t), ":")
+	var secs float64
+	for _, p := range parts {
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return 0, false
+		}
+		secs = secs*60 + v
+	}
+	return secs, true
+}
+
+// startOnKeyframe reports whether startTime lands (within one-frame tolerance)
+// on a video keyframe, meaning a lossless stream-copy cut is possible there.
+func (a *App) startOnKeyframe(input, startTime string) bool {
+	start, ok := timeToSeconds(startTime)
+	if !ok {
+		return false
+	}
+	// Probe keyframes in a short window at/after the start time.
+	interval := fmt.Sprintf("%.3f%%+0.5", start)
+	out, err := exec.Command(ffprobeBin(),
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-skip_frame", "nokey",
+		"-show_entries", "frame=best_effort_timestamp_time",
+		"-read_intervals", interval,
+		"-of", "csv=p=0",
+		input,
+	).Output()
+	if err != nil {
+		return false
+	}
+	const tol = 0.010 // ~one frame at high fps
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ts, err := strconv.ParseFloat(strings.TrimSpace(line), 64)
+		if err != nil {
+			continue
+		}
+		if ts-start >= -tol && ts-start <= tol {
+			return true
+		}
+	}
+	return false
+}
+
+// smartFallbackEncoder picks the best available hardware encoder for a
+// frame-accurate re-encode, preferring the current platform's HW, and falling
+// back to software x264 if no hardware encoder is detected.
+func smartFallbackEncoder() string {
+	var prefer []string
+	if runtime.GOOS == "darwin" {
+		prefer = []string{"h264_videotoolbox"}
+	} else {
+		prefer = []string{"h264_amf", "h264_qsv"}
+	}
+	out, err := exec.Command(ffmpegBin(), "-encoders", "-hide_banner").Output()
+	if err == nil {
+		output := string(out)
+		for _, enc := range prefer {
+			if strings.Contains(output, enc) {
+				return enc
+			}
+		}
+	}
+	return "libx264"
 }
 
 // --- Bound methods ---
@@ -243,8 +359,19 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 	}
 
 	var args []string
-	if params.EncoderMode == "copy" {
-		// Input seeking: fast, cuts on nearest keyframe
+	mode := params.EncoderMode
+	// Smart mode: stream-copy (lossless) when the start lands on a keyframe,
+	// otherwise fall through to a frame-accurate near-lossless re-encode.
+	if mode == "smart" {
+		if a.startOnKeyframe(params.InputPath, params.StartTime) {
+			mode = "copy"
+		} else {
+			mode = smartFallbackEncoder()
+		}
+	}
+
+	if mode == "copy" {
+		// Input seeking: fast, lossless, cuts on nearest keyframe
 		args = []string{
 			"-y",
 			"-ss", params.StartTime,
@@ -257,23 +384,17 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 		}
 	} else {
 		// Output seeking: frame-accurate re-encode
-		var qualityArgs []string
-		if strings.Contains(params.EncoderMode, "videotoolbox") {
-			qualityArgs = []string{"-q:v", "65"}
-		} else if strings.Contains(params.EncoderMode, "qsv") {
-			qualityArgs = []string{"-global_quality", "18"}
-		}
-
 		args = []string{
 			"-y",
 			"-i", params.InputPath,
 			"-ss", params.StartTime,
 			"-to", params.EndTime,
-			"-c:v", params.EncoderMode,
+			"-c:v", mode,
 		}
-		args = append(args, qualityArgs...)
+		args = append(args, qualityArgsFor(mode)...)
 		args = append(args,
 			"-c:a", "aac",
+			"-b:a", "192k",
 			"-map", "0",
 			"-avoid_negative_ts", "make_zero",
 			params.OutputPath,
@@ -299,10 +420,14 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 		return TrimResult{Success: false, Message: "ffmpeg reported success but output file was not created"}
 	}
 
+	how := "re-encoded (" + mode + ")"
+	if mode == "copy" {
+		how = "lossless copy"
+	}
 	sizeMB := float64(stat.Size()) / (1024 * 1024)
 	return TrimResult{
 		Success:    true,
-		Message:    fmt.Sprintf("Done! Saved (%.1f MB): %s", sizeMB, params.OutputPath),
+		Message:    fmt.Sprintf("Done — %s (%.1f MB): %s", how, sizeMB, params.OutputPath),
 		FileSizeMB: sizeMB,
 	}
 }

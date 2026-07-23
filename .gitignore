@@ -11,3 +11,9 @@ __pycache__/
 
 # Wails intermediate
 videotrim-wails/build/bin/*.exe~
+
+# Wails dev/build binaries and bundled ffmpeg (produced by build-macos.sh)
+videotrim-wails/videotrim
+videotrim-wails/build/bin/VideoTrim.app/Contents/MacOS/ffmpeg
+videotrim-wails/build/bin/VideoTrim.app/Contents/MacOS/ffprobe
+videotrim-wails/build/bin/VideoTrim.app/Contents/libs/

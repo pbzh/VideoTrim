@@ -11,8 +11,9 @@ Both use ffmpeg under the hood and share the same feature set.
 
 - **Video preview** with built-in player, scrub bar, and frame-stepping controls
 - **Millisecond-precision** trim range with manual entry or set-from-playhead buttons
+- **Smart mode** (default) — lossless stream-copy when the start is on a keyframe, otherwise a frame-accurate near-lossless hardware re-encode
 - **Stream copy mode** — instant, lossless trimming with no re-encoding (cuts on nearest keyframe)
-- **Hardware-accelerated encoding** — frame-accurate trimming using Apple VideoToolbox (H.264, HEVC) or Intel Quick Sync Video (H.264, HEVC, AV1)
+- **Hardware-accelerated encoding** — frame-accurate trimming using Apple VideoToolbox (H.264, HEVC), AMD AMF (H.264, HEVC, AV1), or Intel Quick Sync Video (H.264, HEVC, AV1)
 - **Cross-platform** — runs on macOS (ARM and Intel) and Windows
 - Displays video format, codec, and audio information
 - Auto-generates output filename (`_trimmed` suffix)
@@ -47,7 +48,20 @@ go mod tidy
 wails build
 ```
 
-The compiled app is output to `build/bin/VideoTrim.app` (macOS) or `build/bin/VideoTrim.exe` (Windows).
+The compiled app is output to `build/bin/VideoTrim.app` (macOS) or `build/bin/VideoTrim.exe` (Windows). A plain `wails build` expects `ffmpeg`/`ffprobe` on the target's PATH (or dropped next to the executable).
+
+### Self-contained macOS build (bundles ffmpeg)
+
+`videotrim-wails/build-macos.sh` builds the app **and** bundles `ffmpeg`, `ffprobe`, and all their dynamic libraries inside the `.app`, so it runs on any Mac with no Homebrew/ffmpeg install.
+
+```bash
+brew install ffmpeg dylibbundler
+cd videotrim-wails
+./build-macos.sh                 # arm64 (Apple Silicon)
+./build-macos.sh darwin/universal  # Intel + Apple Silicon
+```
+
+Output: `build/bin/VideoTrim.app` — fully self-contained. At runtime the app prefers an `ffmpeg`/`ffprobe` sitting next to its own executable, then falls back to PATH.
 
 ### Development (live reload)
 
@@ -165,12 +179,11 @@ MP4, MKV, AVI, MOV, TS, FLV, WMV, WebM, M4V, MPG, MPEG, 3GP — any format suppo
 
 | Mode | Speed | Accuracy | Quality | Requires |
 |------|-------|----------|---------|----------|
+| Smart (default) | Instant / Fast | Frame-accurate | Lossless copy, else near-lossless | Any system |
 | Stream Copy | Instant | Keyframe-aligned | Lossless | Any system |
-| H.264 (VideoToolbox) | Fast | Frame-accurate | High (q 65) | macOS |
-| HEVC (VideoToolbox) | Fast | Frame-accurate | High (q 65) | macOS |
-| H.264 (Intel QSV) | Fast | Frame-accurate | High (global_quality 18) | Intel GPU with QSV |
-| HEVC (Intel QSV) | Fast | Frame-accurate | High (global_quality 18) | Intel GPU with QSV |
-| AV1 (Intel QSV) | Fast | Frame-accurate | High (global_quality 18) | Intel Arc/DG2+ |
+| H.264 / HEVC (VideoToolbox) | Fast | Frame-accurate | Near-lossless (q 80) | macOS |
+| H.264 / HEVC / AV1 (AMD AMF) | Fast | Frame-accurate | Near-lossless (cqp 16) | Windows + AMD GPU |
+| H.264 / HEVC / AV1 (Intel QSV) | Fast | Frame-accurate | Near-lossless (global_quality 16) | Intel GPU with QSV |
 
 **Stream copy** places `-ss` before `-i` (input seeking) for maximum speed. **Re-encode modes** place `-ss` after `-i` (output seeking) for frame-accurate cuts.
 
@@ -181,7 +194,12 @@ Hardware encoders are auto-detected by probing `ffmpeg -encoders` at startup. On
 - **Windows:** Install the latest Intel graphics driver. QSV is supported on most Intel CPUs with integrated graphics (6th gen+) and Intel Arc discrete GPUs.
 - **Linux:** Install the Intel Media SDK or oneVPL runtime (`intel-media-va-driver` on Debian/Ubuntu). Your ffmpeg must be built with `--enable-libmfx` or `--enable-libvpl`.
 
-AV1 hardware encoding requires Intel Arc (Alchemist/DG2) or newer.
+### AMD AMF requirements (Windows)
+
+- Install the latest AMD Adrenalin graphics driver. AMF H.264/HEVC is supported on most modern Radeon GPUs and Ryzen APUs.
+- AV1 hardware encoding requires an RDNA3 GPU (Radeon RX 7000 series) or newer.
+
+AV1 hardware encoding via Intel requires Intel Arc (Alchemist/DG2) or newer.
 
 ## License
 

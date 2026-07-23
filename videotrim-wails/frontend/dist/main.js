@@ -80,6 +80,12 @@ async function initEncoders() {
   encoders = await go.GetAvailableEncoders() || [];
 
   encodingCombo.innerHTML = '';
+
+  const smartOpt = document.createElement('option');
+  smartOpt.value = 'smart';
+  smartOpt.textContent = 'Smart (recommended — lossless when possible)';
+  encodingCombo.appendChild(smartOpt);
+
   const copyOpt = document.createElement('option');
   copyOpt.value = 'copy';
   copyOpt.textContent = 'Stream Copy (fast, no re-encoding)';
@@ -97,6 +103,10 @@ async function initEncoders() {
 
 function updateEncodingHint() {
   const val = encodingCombo.value;
+  if (val === 'smart') {
+    encodingHint.textContent = 'Lossless stream-copy when start is on a keyframe; otherwise a near-lossless hardware re-encode for a frame-accurate cut';
+    return;
+  }
   if (val === 'copy') {
     encodingHint.textContent = 'Fastest — cuts on nearest keyframe, no quality loss';
     return;
