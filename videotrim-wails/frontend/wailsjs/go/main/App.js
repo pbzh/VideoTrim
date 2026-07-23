@@ -42,6 +42,10 @@ export function SelectFolder() {
   return window['go']['main']['App']['SelectFolder']();
 }
 
+export function StopScan() {
+  return window['go']['main']['App']['StopScan']();
+}
+
 export function TrimVideo(arg1) {
   return window['go']['main']['App']['TrimVideo'](arg1);
 }

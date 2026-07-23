@@ -21,6 +21,9 @@ type App struct {
 	ctx          context.Context
 	currentVideo string
 	mu           sync.Mutex
+
+	scanMu     sync.Mutex
+	scanCancel context.CancelFunc // set while a folder scan is running
 }
 
 // NewApp creates a new App instance.
@@ -345,10 +348,10 @@ func (a *App) SelectFolder() string {
 
 // scanFreeze runs freezedetect over the first windowSec seconds of a file and
 // returns the row describing its initial-freeze state.
-func scanFreeze(path string, windowSec float64) ScanRow {
+func scanFreeze(ctx context.Context, path string, windowSec float64) ScanRow {
 	row := ScanRow{File: filepath.Base(path), Path: path}
 	// -t limits decoding to the window, so each file costs ~windowSec of decode.
-	cmd := exec.Command(ffmpegBin(),
+	cmd := exec.CommandContext(ctx, ffmpegBin(),
 		"-hide_banner",
 		"-i", path,
 		"-t", strconv.FormatFloat(windowSec, 'f', 3, 64),
@@ -359,6 +362,10 @@ func scanFreeze(path string, windowSec float64) ScanRow {
 	)
 	out, err := cmd.CombinedOutput()
 	text := string(out)
+	if ctx.Err() != nil {
+		row.Error = "stopped"
+		return row
+	}
 	if err != nil && !strings.Contains(text, "freeze") {
 		// A real failure (bad file, no video stream) — surface a short reason.
 		row.Error = "probe failed"
@@ -411,6 +418,21 @@ func (a *App) ScanFolder(dir string, windowSec float64) []ScanRow {
 		return rows
 	}
 
+	// Cancellable context so StopScan can abort in-flight ffmpeg processes.
+	ctx, cancel := context.WithCancel(context.Background())
+	a.scanMu.Lock()
+	if a.scanCancel != nil {
+		a.scanCancel() // cancel any previous scan still running
+	}
+	a.scanCancel = cancel
+	a.scanMu.Unlock()
+	defer func() {
+		a.scanMu.Lock()
+		a.scanCancel = nil
+		a.scanMu.Unlock()
+		cancel()
+	}()
+
 	// Bounded worker pool — freezedetect is CPU-bound on decode.
 	workers := runtime.NumCPU()
 	if workers > 6 {
@@ -426,21 +448,42 @@ func (a *App) ScanFolder(dir string, windowSec float64) []ScanRow {
 	sem := make(chan struct{}, workers)
 
 	for i, p := range paths {
+		if ctx.Err() != nil {
+			break // stopped — don't dispatch remaining files
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(idx int, path string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rows[idx] = scanFreeze(path, windowSec)
+			row := scanFreeze(ctx, path, windowSec)
+			rows[idx] = row
 			doneMu.Lock()
 			done++
 			d := done
 			doneMu.Unlock()
-			wailsruntime.EventsEmit(a.ctx, "scan:progress", map[string]int{"done": d, "total": total})
+			wailsruntime.EventsEmit(a.ctx, "scan:progress", map[string]interface{}{
+				"done":        d,
+				"total":       total,
+				"file":        row.File,
+				"frozenIntro": row.FrozenIntro,
+				"firstChange": row.FirstChange,
+				"freezeSec":   row.FreezeSec,
+				"error":       row.Error,
+			})
 		}(i, p)
 	}
 	wg.Wait()
 	return rows
+}
+
+// StopScan cancels an in-progress folder scan, if any.
+func (a *App) StopScan() {
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if a.scanCancel != nil {
+		a.scanCancel()
+	}
 }
 
 // secondsToTime formats seconds as HH:MM:SS.mmm.

@@ -22,4 +22,6 @@ export function ScanFolder(arg1:string,arg2:number):Promise<Array<main.ScanRow>>
 
 export function SelectFolder():Promise<string>;
 
+export function StopScan():Promise<void>;
+
 export function TrimVideo(arg1:main.TrimParams):Promise<main.TrimResult>;

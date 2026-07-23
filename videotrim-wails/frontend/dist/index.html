@@ -97,11 +97,14 @@
       <div class="group-title">Folder Freeze Scan</div>
       <div class="row">
         <button id="scan-folder-btn" class="btn">Scan Folder…</button>
+        <button id="scan-stop-btn" class="btn" disabled>Stop</button>
         <label>First</label>
         <input type="number" id="scan-window" class="num-input" value="10" min="1" max="120" step="1" />
         <label>sec</label>
+        <label class="check-label"><input type="checkbox" id="scan-log-toggle" /> Log</label>
         <span id="scan-status" class="info-text"></span>
       </div>
+      <div id="scan-log" class="scan-log hidden"></div>
     </div>
 
   </div>

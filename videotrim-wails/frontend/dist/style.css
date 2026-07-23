@@ -271,6 +271,24 @@ label { color: var(--dim); white-space: nowrap; }
 }
 .num-input:focus { border-color: var(--accent); }
 
+.hidden { display: none !important; }
+
+.scan-log {
+  margin-top: 6px;
+  max-height: 120px;
+  overflow: auto;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 5px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--dim);
+}
+.scan-log-line { white-space: nowrap; padding: 1px 0; }
+.scan-log-line.scan-frozen { color: var(--success); }
+.scan-log-line.scan-err { color: var(--error); }
+
 .modal-overlay.hidden { display: none; }
 .modal-overlay {
   position: fixed;

@@ -414,21 +414,51 @@ function showStatus(msg, type) {
 // --- Folder freeze scan ---
 
 const scanFolderBtn = el('scan-folder-btn');
+const scanStopBtn   = el('scan-stop-btn');
 const scanWindow    = el('scan-window');
 const scanStatus    = el('scan-status');
+const scanLogToggle = el('scan-log-toggle');
+const scanLog       = el('scan-log');
 const scanTbody     = el('scan-tbody');
 const scanModal     = el('scan-modal');
 const scanModalTitle = el('scan-modal-title');
 const scanCloseBtn  = el('scan-close-btn');
 
+let scanning = false;
+
 scanCloseBtn.addEventListener('click', () => scanModal.classList.add('hidden'));
 scanModal.addEventListener('click', e => { if (e.target === scanModal) scanModal.classList.add('hidden'); });
+
+scanLogToggle.addEventListener('change', () => {
+  scanLog.classList.toggle('hidden', !scanLogToggle.checked);
+});
+
+function appendLog(p) {
+  const n = String(p.done).padStart(String(p.total).length, ' ');
+  let result;
+  if (p.error) result = `⚠ ${p.error}`;
+  else if (p.frozenIntro) result = `frozen → ${p.firstChange} (${(p.freezeSec || 0).toFixed(2)}s)`;
+  else result = 'no freeze';
+  const line = document.createElement('div');
+  line.className = 'scan-log-line' + (p.error ? ' scan-err' : (p.frozenIntro ? ' scan-frozen' : ''));
+  line.textContent = `[${n}/${p.total}] ${p.file} — ${result}`;
+  scanLog.appendChild(line);
+  scanLog.scrollTop = scanLog.scrollHeight;
+}
 
 // Live progress from the Go scanner.
 if (window.runtime && window.runtime.EventsOn) {
   window.runtime.EventsOn('scan:progress', p => {
-    if (p && p.total) scanStatus.textContent = `Scanning… ${p.done}/${p.total}`;
+    if (!p || !p.total) return;
+    scanStatus.textContent = `Scanning… ${p.done}/${p.total}`;
+    appendLog(p);
   });
+}
+
+function setScanning(on) {
+  scanning = on;
+  scanFolderBtn.disabled = on;
+  scanStopBtn.disabled = !on;
 }
 
 scanFolderBtn.addEventListener('click', async () => {
@@ -436,9 +466,10 @@ scanFolderBtn.addEventListener('click', async () => {
   if (!dir) return;
 
   const win = Math.max(1, parseFloat(scanWindow.value) || 10);
-  scanFolderBtn.disabled = true;
+  setScanning(true);
   scanStatus.textContent = 'Scanning…';
   scanTbody.innerHTML = '';
+  scanLog.innerHTML = '';
 
   try {
     const rows = await go.ScanFolder(dir, win);
@@ -446,17 +477,29 @@ scanFolderBtn.addEventListener('click', async () => {
   } catch (e) {
     scanStatus.textContent = 'Scan failed: ' + String(e);
   } finally {
-    scanFolderBtn.disabled = false;
+    setScanning(false);
   }
+});
+
+scanStopBtn.addEventListener('click', async () => {
+  scanStopBtn.disabled = true;
+  scanStatus.textContent = 'Stopping…';
+  await go.StopScan();
 });
 
 function renderScan(rows, win) {
   scanTbody.innerHTML = '';
-  if (!rows || rows.length === 0) {
-    scanStatus.textContent = 'No video files found in that folder.';
+  const totalFiles = rows ? rows.length : 0;
+  // Drop rows for files that were never scanned (e.g. after Stop).
+  rows = (rows || []).filter(r => r && r.file);
+  if (rows.length === 0) {
+    scanStatus.textContent = totalFiles === 0
+      ? 'No video files found in that folder.'
+      : 'Scan stopped before any file completed.';
     scanModal.classList.add('hidden');
     return;
   }
+  const stopped = rows.length < totalFiles;
 
   // Frozen intros first, longest freeze first.
   rows.sort((a, b) => (b.frozenIntro - a.frozenIntro) || (b.freezeSec - a.freezeSec));
@@ -490,7 +533,8 @@ function renderScan(rows, win) {
     scanTbody.appendChild(tr);
   }
 
-  const summary = `${rows.length} file(s) — ${frozenCount} with a frozen intro (first ${win}s)`;
+  const stoppedNote = stopped ? ` (stopped — ${rows.length}/${totalFiles} scanned)` : '';
+  const summary = `${rows.length} file(s) — ${frozenCount} with a frozen intro (first ${win}s)${stoppedNote}`;
   scanModalTitle.textContent = 'Folder Freeze Scan — ' + summary;
   scanStatus.textContent = summary + '.';
   scanModal.classList.remove('hidden');
