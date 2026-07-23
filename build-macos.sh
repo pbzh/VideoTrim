@@ -25,8 +25,8 @@ python3 -m PyInstaller --noconfirm --windowed --onedir --name VideoTrim \
   --distpath build/macos-python/dist \
   --workpath build/macos-python/work \
   --specpath build/macos-python \
-  --add-binary "${FFMPEG}:ffmpeg" \
-  --add-binary "${FFPROBE}:ffmpeg" \
+  --add-binary "${FFMPEG}:." \
+  --add-binary "${FFPROBE}:." \
   --osx-bundle-identifier com.pblab.videotrim \
   videotrim.py
 

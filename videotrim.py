@@ -8,13 +8,18 @@ Minimal-quality-loss trimming built on ffmpeg:
   * Stream Copy     — instant, lossless, keyframe-aligned.
   * VideoToolbox    — hardware H.264 / HEVC, frame-accurate, near-lossless.
 
+Hardware encoders are auto-detected per machine: Apple VideoToolbox on macOS,
+AMD AMF and Intel Quick Sync on Windows (software x264 is the fallback).
+
 Extras:
   * Detect Start    — find the first real frame change (skip a frozen intro).
   * Overwrite source — replace the opened file with the trimmed result.
   * Folder Freeze Scan — check every video in a folder for a frozen intro,
                       show a table, and batch-trim the selected files in place.
+  * ffmpeg log window (View menu) and a global Stop All button.
 
-macOS / Apple Silicon only — needs ffmpeg and ffprobe (brew install ffmpeg).
+Cross-platform (macOS / Windows). Needs ffmpeg and ffprobe on PATH, or bundled
+alongside the executable (see build-macos.sh / build-windows.ps1).
 """
 
 from __future__ import annotations
@@ -43,19 +48,30 @@ from PyQt6.QtWidgets import (
 )
 
 # --------------------------------------------------------------------------
-# Tool resolution — prefer a bundled ffmpeg, else PATH / Homebrew.
+# Tool resolution — cross-platform; prefer a bundled ffmpeg, else PATH.
 # --------------------------------------------------------------------------
 
-EXTRA_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+IS_WIN = os.name == "nt"
+_EXE = ".exe" if IS_WIN else ""
+
+# Suppress console-window flashes for every ffmpeg spawn on Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
+
+if IS_WIN:
+    EXTRA_PATHS = [
+        r"C:\ffmpeg\bin",
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "ffmpeg", "bin"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links"),
+    ]
+else:
+    EXTRA_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv",
     ".wmv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp",
 }
-# Formats the Qt/AVFoundation preview can decode; others still trim via ffmpeg.
+# Formats the Qt preview backend can usually decode; others still trim via ffmpeg.
 PREVIEWABLE = {".mp4", ".m4v", ".mov"}
-
-# No console window flashes on subprocess spawn (harmless on macOS).
-_NO_WINDOW = 0
 
 
 def _app_dir() -> Path:
@@ -65,15 +81,18 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def find_tool(name: str) -> str:
+def find_tool(base_name: str) -> str:
+    name = base_name + _EXE
     for base in (_app_dir(), Path(getattr(sys, "_MEIPASS", _app_dir()))):
         cand = base / name
         if cand.exists():
             return str(cand)
-    which = shutil.which(name)
+    which = shutil.which(name) or shutil.which(base_name)
     if which:
         return which
     for d in EXTRA_PATHS:
+        if not d:
+            continue
         cand = Path(d) / name
         if cand.exists():
             return str(cand)
@@ -157,6 +176,8 @@ _WORKERS_LOCK = threading.Lock()
 
 def spawn(args: list[str], **kw) -> subprocess.Popen:
     """Start a tracked subprocess so Stop All can kill it."""
+    if _NO_WINDOW:
+        kw.setdefault("creationflags", _NO_WINDOW)
     p = subprocess.Popen(args, **kw)
     with _PROCS_LOCK:
         _PROCS.add(p)
@@ -303,12 +324,21 @@ def get_video_info(path: str) -> dict:
     return _probe(path)
 
 
-# (label, encoder, hint) — macOS VideoToolbox only.
+# (label, encoder, hint) — availability-filtered per machine at runtime.
 _HW_ENCODERS = [
     ("H.264 (VideoToolbox)", "h264_videotoolbox",
-     "Hardware H.264 — frame-accurate, fast"),
+     "Apple hardware H.264 — frame-accurate, fast"),
     ("HEVC (VideoToolbox)", "hevc_videotoolbox",
-     "Hardware HEVC — frame-accurate, smaller files"),
+     "Apple hardware HEVC — smaller files"),
+    ("H.264 (AMD AMF)", "h264_amf",
+     "AMD hardware H.264 (Windows) — frame-accurate, fast"),
+    ("HEVC (AMD AMF)", "hevc_amf",
+     "AMD hardware HEVC (Windows) — smaller files"),
+    ("AV1 (AMD AMF)", "av1_amf",
+     "AMD hardware AV1 (RDNA3+, Windows) — best compression"),
+    ("H.264 (Intel QSV)", "h264_qsv", "Intel Quick Sync H.264"),
+    ("HEVC (Intel QSV)", "hevc_qsv", "Intel Quick Sync HEVC"),
+    ("AV1 (Intel QSV)", "av1_qsv", "Intel Quick Sync AV1"),
 ]
 
 
@@ -322,15 +352,22 @@ def available_encoders() -> list[dict]:
 def quality_args(encoder: str) -> list[str]:
     if "videotoolbox" in encoder:
         return ["-q:v", "80"]           # 1-100, higher = better; ~visually lossless
+    if "amf" in encoder:                # AMD: constant-QP, lower = better; no qp_b (av1)
+        return ["-rc", "cqp", "-qp_i", "16", "-qp_p", "16", "-quality", "quality"]
+    if "qsv" in encoder:                # Intel: ICQ global_quality, lower = better
+        return ["-global_quality", "16"]
     if "libx26" in encoder:
         return ["-crf", "16", "-preset", "medium"]
     return []
 
 
 def smart_fallback_encoder() -> str:
-    cp = run([FFMPEG, "-hide_banner", "-encoders"], label="encoders")
-    if "h264_videotoolbox" in (cp.stdout or ""):
-        return "h264_videotoolbox"
+    """Best available HW encoder for a frame-accurate re-encode, by platform."""
+    out = (run([FFMPEG, "-hide_banner", "-encoders"], label="encoders").stdout or "")
+    prefer = ["h264_videotoolbox"] if sys.platform == "darwin" else ["h264_amf", "h264_qsv"]
+    for enc in prefer:
+        if enc in out:
+            return enc
     return "libx264"
 
 
