@@ -1,1426 +1,1204 @@
 #!/usr/bin/env python3
-"""VideoTrim - Simple video trimmer using ffmpeg."""
+"""VideoTrim — a simple, fast video trimmer for macOS (Apple Silicon).
 
-import contextlib
-import json
+Minimal-quality-loss trimming built on ffmpeg:
+  * Smart mode      — lossless stream-copy when the cut is on a keyframe,
+                      otherwise a frame-accurate near-lossless VideoToolbox
+                      re-encode.
+  * Stream Copy     — instant, lossless, keyframe-aligned.
+  * VideoToolbox    — hardware H.264 / HEVC, frame-accurate, near-lossless.
+
+Extras:
+  * Detect Start    — find the first real frame change (skip a frozen intro).
+  * Overwrite source — replace the opened file with the trimmed result.
+  * Folder Freeze Scan — check every video in a folder for a frozen intro,
+                      show a table, and batch-trim the selected files in place.
+
+macOS / Apple Silicon only — needs ffmpeg and ffprobe (brew install ffmpeg).
+"""
+
+from __future__ import annotations
+
 import os
 import re
-import subprocess
 import sys
-import tempfile
-from functools import partial
+import json
+import shutil
+import threading
+import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PyQt6.QtCore import QProcess, QTime, Qt, QUrl
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QSlider,
-    QStyle,
-    QTimeEdit,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QMainWindow, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
+    QSlider, QSpinBox, QFileDialog, QMessageBox, QPlainTextEdit, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QSizePolicy,
 )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Tool resolution — prefer a bundled ffmpeg, else PATH / Homebrew.
+# --------------------------------------------------------------------------
 
-SUPPORTED_FORMATS = (
-    "Video Files (*.mp4 *.mkv *.avi *.mov *.ts *.flv *.wmv *.webm *.m4v *.mpg *.mpeg *.3gp);;"
-    "All Files (*)"
-)
+EXTRA_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".ts", ".flv",
+    ".wmv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp",
+}
+# Formats the Qt/AVFoundation preview can decode; others still trim via ffmpeg.
+PREVIEWABLE = {".mp4", ".m4v", ".mov"}
 
-ENCODING_STREAM_COPY = "Stream Copy (fast, no re-encoding)"
-
-# (label, ffmpeg encoder name, UI hint)
-HW_ENCODERS = [
-    (
-        "H.264 (Apple VideoToolbox)",
-        "h264_videotoolbox",
-        "Hardware-accelerated H.264 — frame-accurate, fast",
-    ),
-    (
-        "HEVC (Apple VideoToolbox)",
-        "hevc_videotoolbox",
-        "Hardware-accelerated HEVC — frame-accurate, smaller files",
-    ),
-    (
-        "H.264 (Intel QSV)",
-        "h264_qsv",
-        "Hardware-accelerated H.264 via Intel Quick Sync",
-    ),
-    (
-        "HEVC (Intel QSV)",
-        "hevc_qsv",
-        "Hardware-accelerated HEVC via Intel Quick Sync",
-    ),
-    (
-        "AV1 (Intel QSV)",
-        "av1_qsv",
-        "Hardware-accelerated AV1 via Intel Quick Sync — best compression",
-    ),
-]
-
-# UI colours — defined centrally so theme changes are a one-liner.
-COLOR_DIM = "color: #888888;"
-COLOR_SUCCESS = "color: #4ec994;"
-COLOR_ERROR = "color: #f14c4c;"
-COLOR_NORMAL = ""
+# No console window flashes on subprocess spawn (harmless on macOS).
+_NO_WINDOW = 0
 
 
-# ---------------------------------------------------------------------------
-# ffmpeg / ffprobe discovery
-# ---------------------------------------------------------------------------
-# _find_tool is defined first so that FFMPEG / FFPROBE can be assigned at
-# module level before _probe_available_hw_encoders (which references them)
-# is ever called.
-
-
-def _find_tool(name: str) -> str:
-    """Return the path to *name* (ffmpeg or ffprobe).
-
-    When running as a frozen PyInstaller bundle the binary is looked for in
-    several candidate locations before falling back to the system PATH.
-    """
-    exe_name = f"{name}.exe" if sys.platform == "win32" else name
-
+def _app_dir() -> Path:
+    # PyInstaller onefile unpacks to _MEIPASS; onedir puts binaries beside exe.
     if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent
-        candidates: list[Path] = []
-
-        if sys.platform == "darwin":
-            # py2app / PyInstaller .app bundle — Resources and Frameworks dirs
-            candidates.append(base.parent / "Resources" / "ffmpeg" / exe_name)
-            candidates.append(base.parent / "Frameworks" / "ffmpeg" / exe_name)
-
-        # PyInstaller onedir layouts:
-        #   pre-6.x  → binary sits beside the executable
-        #   6.x+     → binary lives under _internal/
-        # PyInstaller onefile → extracted to _MEIPASS at runtime
-        candidates.append(base / "ffmpeg" / exe_name)
-        candidates.append(base / "_internal" / "ffmpeg" / exe_name)
-
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(Path(meipass) / "ffmpeg" / exe_name)
-
-        for c in candidates:
-            if c.is_file():
-                return str(c)
-
-    return exe_name  # fall back to PATH
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 
-FFMPEG = _find_tool("ffmpeg")
-FFPROBE = _find_tool("ffprobe")
+def find_tool(name: str) -> str:
+    for base in (_app_dir(), Path(getattr(sys, "_MEIPASS", _app_dir()))):
+        cand = base / name
+        if cand.exists():
+            return str(cand)
+    which = shutil.which(name)
+    if which:
+        return which
+    for d in EXTRA_PATHS:
+        cand = Path(d) / name
+        if cand.exists():
+            return str(cand)
+    return name
 
 
-def _probe_available_hw_encoders() -> list[tuple[str, str, str]]:
-    """Probe ffmpeg for available hardware encoders and return matching entries."""
+FFMPEG = find_tool("ffmpeg")
+FFPROBE = find_tool("ffprobe")
+
+
+def run(args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Run a command, capturing text output; never raises on non-zero exit."""
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout,
+        creationflags=_NO_WINDOW if os.name == "nt" else 0,
+    )
+
+
+# --------------------------------------------------------------------------
+# Time helpers (millisecond precision, HH:MM:SS.mmm)
+# --------------------------------------------------------------------------
+
+_TIME_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})(?:[.,](\d{1,3}))?$")
+
+
+def ms_to_time(ms: int) -> str:
+    ms = max(0, int(round(ms)))
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, msec = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{msec:03d}"
+
+
+def time_to_ms(text: str) -> int:
+    m = _TIME_RE.match(text.strip())
+    if not m:
+        return -1
+    msec = int((m.group(4) or "0").ljust(3, "0")) if m.group(4) else 0
+    return int(m.group(1)) * 3_600_000 + int(m.group(2)) * 60_000 + int(m.group(3)) * 1000 + msec
+
+
+def seconds_to_time(sec: float) -> str:
+    return ms_to_time(int(round(max(0.0, sec) * 1000)))
+
+
+def time_to_seconds(text: str) -> float | None:
+    parts = text.strip().split(":")
     try:
-        result = subprocess.run(
-            [FFMPEG, "-encoders", "-hide_banner"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        output = result.stdout
-        return [(label, enc, hint) for label, enc, hint in HW_ENCODERS if enc in output]
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-
-def get_video_info(filepath: str) -> dict | None:
-    """Return the ffprobe JSON dict for *filepath*, or None on failure."""
-    try:
-        result = subprocess.run(
-            [
-                FFPROBE,
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-show_format",
-                filepath,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        data = json.loads(result.stdout)
-        if "format" not in data:
-            return None
-        return data
-    except (json.JSONDecodeError, FileNotFoundError, OSError):
+        secs = 0.0
+        for p in parts:
+            secs = secs * 60 + float(p)
+        return secs
+    except ValueError:
         return None
 
 
-def ms_to_qtime(ms: int) -> QTime:
-    # NOTE: QTimeEdit cannot represent times >= 24 h (Qt limitation).
-    # Videos longer than 24 h will have their duration capped by the widget.
-    h = ms // 3_600_000
-    m = (ms % 3_600_000) // 60_000
-    s = (ms % 60_000) // 1000
-    msec = ms % 1000
-    return QTime(h, m, s, msec)
+# --------------------------------------------------------------------------
+# ffprobe / encoder helpers
+# --------------------------------------------------------------------------
+
+def get_video_info(path: str) -> dict:
+    cp = run([FFPROBE, "-v", "quiet", "-print_format", "json",
+              "-show_streams", "-show_format", path])
+    if cp.returncode != 0 or not cp.stdout:
+        return {"error": "ffprobe failed — is ffmpeg installed?"}
+    try:
+        data = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return {"error": "could not parse ffprobe output"}
+
+    fmt = data.get("format") or {}
+    info: dict = {
+        "format": fmt.get("format_name", ""),
+        "vcodec": "", "acodec": "", "duration_ms": 0, "fps": 0.0,
+    }
+    try:
+        info["duration_ms"] = int(float(fmt.get("duration", 0)) * 1000)
+    except (TypeError, ValueError):
+        pass
+
+    for st in data.get("streams", []):
+        kind = st.get("codec_type")
+        if kind == "video" and not info["vcodec"]:
+            info["vcodec"] = st.get("codec_name", "")
+            r = st.get("r_frame_rate", "")
+            if "/" in r:
+                num, den = r.split("/", 1)
+                try:
+                    n, d = float(num), float(den)
+                    if n > 0 and d > 0:
+                        info["fps"] = n / d
+                except ValueError:
+                    pass
+        elif kind == "audio" and not info["acodec"]:
+            info["acodec"] = st.get("codec_name", "")
+
+    if not info["vcodec"]:
+        return {"error": "no video stream found"}
+    return info
 
 
-def qtime_to_ms(t: QTime) -> int:
-    return t.hour() * 3_600_000 + t.minute() * 60_000 + t.second() * 1000 + t.msec()
+# (label, encoder, hint) — macOS VideoToolbox only.
+_HW_ENCODERS = [
+    ("H.264 (VideoToolbox)", "h264_videotoolbox",
+     "Hardware H.264 — frame-accurate, fast"),
+    ("HEVC (VideoToolbox)", "hevc_videotoolbox",
+     "Hardware HEVC — frame-accurate, smaller files"),
+]
 
 
-def qtime_to_ffmpeg(t: QTime) -> str:
-    """Format a QTime as HH:mm:ss.zzz (accepted by ffmpeg -ss / -to)."""
-    return t.toString("HH:mm:ss.zzz")
+def available_encoders() -> list[dict]:
+    cp = run([FFMPEG, "-hide_banner", "-encoders"])
+    out = cp.stdout or ""
+    return [{"label": lbl, "encoder": enc, "hint": hint}
+            for (lbl, enc, hint) in _HW_ENCODERS if enc in out]
 
 
-def format_ms(ms: int) -> str:
-    s, ms_rem = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms_rem:03d}"
+def quality_args(encoder: str) -> list[str]:
+    if "videotoolbox" in encoder:
+        return ["-q:v", "80"]           # 1-100, higher = better; ~visually lossless
+    if "libx26" in encoder:
+        return ["-crf", "16", "-preset", "medium"]
+    return []
 
 
-def _parse_initial_freeze_end(text: str) -> float | None:
-    """Parse ffmpeg freezedetect stderr and return the timestamp (seconds) at
-    which the initial freeze ends — i.e. the moment of the first real frame
-    change.  Returns None when no freeze is detected at the start of the video.
+def smart_fallback_encoder() -> str:
+    cp = run([FFMPEG, "-hide_banner", "-encoders"])
+    if "h264_videotoolbox" in (cp.stdout or ""):
+        return "h264_videotoolbox"
+    return "libx264"
 
-    freezedetect emits lines like:
-        [freezedetect @ 0x...] freeze_start: 0.000000
-        [freezedetect @ 0x...] freeze_duration: 2.167
-        [freezedetect @ 0x...] freeze_end: 2.167
+
+def start_on_keyframe(path: str, start_time: str) -> bool:
+    start = time_to_seconds(start_time)
+    if start is None:
+        return False
+    cp = run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+              "-skip_frame", "nokey",
+              "-show_entries", "frame=best_effort_timestamp_time",
+              "-read_intervals", f"{start:.3f}%+0.5",
+              "-of", "csv=p=0", path])
+    if cp.returncode != 0:
+        return False
+    for line in cp.stdout.splitlines():
+        try:
+            ts = float(line.strip())
+        except ValueError:
+            continue
+        if abs(ts - start) <= 0.010:    # ~one frame tolerance
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Freeze detection
+# --------------------------------------------------------------------------
+
+_FS_RE = re.compile(r"freeze_start:\s*([\d.]+)")
+_FE_RE = re.compile(r"freeze_end:\s*([\d.]+)")
+
+
+def parse_initial_freeze(text: str) -> tuple[bool, float, bool]:
+    """Return (starts_frozen, freeze_end_seconds, has_end).
+
+    Detects a freeze that begins at/near t=0 (a frozen intro).
     """
-    found_zero_start = False
+    frozen = False
     for line in text.splitlines():
         if "freeze_start:" in line:
-            m = re.search(r"freeze_start:\s*([\d.]+)", line)
-            if m and float(m.group(1)) < 0.5:   # freeze begins at or near t=0
-                found_zero_start = True
-        elif "freeze_end:" in line and found_zero_start:
-            m = re.search(r"freeze_end:\s*([\d.]+)", line)
+            m = _FS_RE.search(line)
+            if m and float(m.group(1)) < 0.5:
+                frozen = True
+        elif "freeze_end:" in line and frozen:
+            m = _FE_RE.search(line)
             if m:
-                return float(m.group(1))
-    return None
+                return True, float(m.group(1)), True
+    return frozen, 0.0, False
 
 
-# ---------------------------------------------------------------------------
-# Bulk processing dialog
-# ---------------------------------------------------------------------------
+def detect_first_change(path: str) -> str:
+    """First real frame change as HH:MM:SS.mmm ('' if no ≥1s frozen intro).
 
-
-class BulkDialog(QDialog):
-    """Trim a list of video files in sequence.
-
-    For each file the dialog:
-      1. Runs ffmpeg freezedetect to find the first real frame change.
-      2. Trims from that timestamp to the end of the file.
-      3. Saves as ``<name>_trimmed.<ext>`` or replaces the source file,
-         depending on the *replace_source* flag inherited from the main window.
+    Streams ffmpeg and stops the moment the first freeze_end is seen, so it
+    only decodes up to the first change instead of the whole file.
     """
-
-    def __init__(
-        self,
-        parent: QWidget,
-        encoder_name: str,
-        replace_source: bool,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Bulk Trim")
-        self.setMinimumSize(620, 420)
-
-        self._encoder_name = encoder_name
-        self._replace_source = replace_source
-
-        # Per-file state (parallel lists)
-        self._files: list[str] = []
-        self._statuses: list[str] = []
-
-        # Processing state
-        self._running = False
-        self._current_idx = 0
-        self._detect_process: QProcess | None = None
-        self._detect_output: list[bytes] = []
-        self._trim_process: QProcess | None = None
-        self._trim_output: list[bytes] = []
-        self._tmp_path: str | None = None
-        self._current_start_ms: int = 0
-
-        self._build_ui()
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-
-        self.list_widget = QListWidget()
-        self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection
-        )
-        layout.addWidget(self.list_widget, stretch=1)
-
-        file_row = QHBoxLayout()
-        self.add_btn = QPushButton("Add Files\u2026")
-        self.add_btn.clicked.connect(self._add_files)
-        file_row.addWidget(self.add_btn)
-
-        self.remove_btn = QPushButton("Remove Selected")
-        self.remove_btn.clicked.connect(self._remove_selected)
-        file_row.addWidget(self.remove_btn)
-
-        file_row.addStretch()
-        layout.addLayout(file_row)
-
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet(COLOR_DIM)
-        layout.addWidget(self.status_label)
-
-        action_row = QHBoxLayout()
-        action_row.addStretch()
-
-        self.process_btn = QPushButton("Process All")
-        self.process_btn.setDefault(True)
-        self.process_btn.clicked.connect(self._start_processing)
-        action_row.addWidget(self.process_btn)
-
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop_processing)
-        action_row.addWidget(self.stop_btn)
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        action_row.addWidget(close_btn)
-
-        layout.addLayout(action_row)
-
-    # ------------------------------------------------------------------
-    # File list helpers
-    # ------------------------------------------------------------------
-
-    def _add_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add Video Files", "", SUPPORTED_FORMATS
-        )
-        for path in paths:
-            if path not in self._files:
-                self._files.append(path)
-                self._statuses.append("Pending")
-                self.list_widget.addItem(self._make_item(len(self._files) - 1))
-
-    def _remove_selected(self) -> None:
-        if self._running:
-            return
-        rows = sorted(
-            {self.list_widget.row(i) for i in self.list_widget.selectedItems()},
-            reverse=True,
-        )
-        for row in rows:
-            self.list_widget.takeItem(row)
-            self._files.pop(row)
-            self._statuses.pop(row)
-
-    def _make_item(self, idx: int) -> QListWidgetItem:
-        item = QListWidgetItem(self._item_text(idx))
-        self._colour_item(item, self._statuses[idx])
-        return item
-
-    def _update_item(self, idx: int, status: str) -> None:
-        self._statuses[idx] = status
-        item = self.list_widget.item(idx)
-        if item is None:
-            return
-        item.setText(self._item_text(idx))
-        self._colour_item(item, status)
-
-    def _item_text(self, idx: int) -> str:
-        return f"  {Path(self._files[idx]).name}  \u2014  {self._statuses[idx]}"
-
-    @staticmethod
-    def _colour_item(item: QListWidgetItem, status: str) -> None:
-        if status.startswith("Done"):
-            item.setForeground(QBrush(QColor("#4ec994")))
-        elif status.startswith("Error"):
-            item.setForeground(QBrush(QColor("#f14c4c")))
-        else:
-            item.setForeground(QBrush(QColor("#cccccc")))
-
-    # ------------------------------------------------------------------
-    # Processing pipeline
-    # ------------------------------------------------------------------
-
-    def _start_processing(self) -> None:
-        if not self._files:
-            self.status_label.setText("No files added.")
-            return
-
-        self._running = True
-        self.process_btn.setEnabled(False)
-        self.add_btn.setEnabled(False)
-        self.remove_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.progress.setRange(0, len(self._files))
-        self.progress.setValue(0)
-        self.progress.setVisible(True)
-        self.status_label.setStyleSheet(COLOR_DIM)
-        self.status_label.setText("")
-
-        for i in range(len(self._files)):
-            if not self._statuses[i].startswith("Done"):
-                self._update_item(i, "Pending")
-
-        self._current_idx = 0
-        self._process_next()
-
-    def _process_next(self) -> None:
-        while (
-            self._current_idx < len(self._files)
-            and self._statuses[self._current_idx].startswith("Done")
-        ):
-            self._current_idx += 1
-
-        if self._current_idx >= len(self._files):
-            self._finish_all()
-            return
-
-        self._run_detect()
-
-    def _run_detect(self) -> None:
-        path = self._files[self._current_idx]
-        self._update_item(self._current_idx, "Detecting\u2026")
-        self._detect_output = []
-
-        self._detect_process = QProcess(self)
-        self._detect_process.setProcessChannelMode(
-            QProcess.ProcessChannelMode.MergedChannels
-        )
-        self._detect_process.readyReadStandardOutput.connect(self._on_detect_output)
-        self._detect_process.finished.connect(self._on_detect_finished)
-        self._detect_process.start(
-            FFMPEG,
-            [
-                "-hide_banner",
-                "-i", path,
-                "-vf", "freezedetect=n=-40dB:d=0",
-                "-map", "0:v:0",
-                "-f", "null",
-                "-",
-            ],
-        )
-
-    def _on_detect_output(self) -> None:
-        if self._detect_process is None:
-            return
-        chunk = self._detect_process.readAllStandardOutput().data()
-        self._detect_output.append(chunk)
-        text = b"".join(self._detect_output).decode(errors="replace")
-        if _parse_initial_freeze_end(text) is not None:
-            self._detect_process.kill()
-
-    def _on_detect_finished(self, _exit_code: int, _exit_status) -> None:
-        if self._detect_process is not None:
-            tail = self._detect_process.readAllStandardOutput().data()
-            if tail:
-                self._detect_output.append(tail)
-        self._detect_process = None
-
-        text = b"".join(self._detect_output).decode(errors="replace")
-        self._detect_output = []
-
-        freeze_end_s = _parse_initial_freeze_end(text)
-        self._current_start_ms = (
-            int(freeze_end_s * 1000) if freeze_end_s is not None else 0
-        )
-
-        if self._running:
-            self._run_trim()
-
-    def _run_trim(self) -> None:
-        idx = self._current_idx
-        path = self._files[idx]
-        start = format_ms(self._current_start_ms)  # HH:MM:SS.mmm — accepted by ffmpeg
-
-        if self._replace_source:
-            ext = Path(path).suffix
-            fd, tmp = tempfile.mkstemp(suffix=ext, dir=str(Path(path).parent))
-            os.close(fd)
-            self._tmp_path = tmp
-            output = tmp
-        else:
-            self._tmp_path = None
-            output = str(Path(path).with_stem(Path(path).stem + "_trimmed"))
-
-        self._update_item(idx, f"Trimming from {start}\u2026")
-
-        enc = self._encoder_name
-        if enc == "copy":
-            cmd = [
-                FFMPEG, "-y",
-                "-ss", start,
-                "-i", path,
-                "-c", "copy",
-                "-map", "0",
-                "-avoid_negative_ts", "make_zero",
-                output,
-            ]
-        else:
-            quality_args: list[str] = []
-            if "videotoolbox" in enc:
-                quality_args = ["-q:v", "65"]
-            elif "qsv" in enc:
-                quality_args = ["-global_quality", "18"]
-            cmd = [
-                FFMPEG, "-y",
-                "-i", path,
-                "-ss", start,
-                "-c:v", enc,
-                *quality_args,
-                "-c:a", "aac",
-                "-map", "0",
-                "-avoid_negative_ts", "make_zero",
-                output,
-            ]
-
-        self._trim_output = []
-        self._trim_process = QProcess(self)
-        self._trim_process.setProcessChannelMode(
-            QProcess.ProcessChannelMode.MergedChannels
-        )
-        self._trim_process.readyReadStandardOutput.connect(self._on_trim_output)
-        self._trim_process.finished.connect(self._on_trim_finished)
-        self._trim_process.start(cmd[0], cmd[1:])
-
-    def _on_trim_output(self) -> None:
-        if self._trim_process is not None:
-            self._trim_output.append(
-                self._trim_process.readAllStandardOutput().data()
-            )
-
-    def _on_trim_finished(self, exit_code: int, _exit_status) -> None:
-        if self._trim_process is not None:
-            tail = self._trim_process.readAllStandardOutput().data()
-            if tail:
-                self._trim_output.append(tail)
-        self._trim_process = None
-
-        idx = self._current_idx
-        path = self._files[idx]
-        tmp, self._tmp_path = self._tmp_path, None
-
-        if exit_code != 0:
-            with contextlib.suppress(OSError):
-                if tmp:
-                    os.unlink(tmp)
-            self._update_item(idx, "Error \u2014 ffmpeg failed")
-        elif self._replace_source and tmp:
-            try:
-                os.replace(tmp, path)
-                size_mb = os.path.getsize(path) / (1024 * 1024)
-                self._update_item(idx, f"Done \u2014 replaced ({size_mb:.1f}\u00a0MB)")
-            except OSError as exc:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
-                self._update_item(idx, f"Error \u2014 {exc}")
-        else:
-            out = str(Path(path).with_stem(Path(path).stem + "_trimmed"))
-            if os.path.isfile(out):
-                size_mb = os.path.getsize(out) / (1024 * 1024)
-                self._update_item(idx, f"Done ({size_mb:.1f}\u00a0MB)")
-            else:
-                self._update_item(idx, "Error \u2014 output not created")
-
-        self._current_idx += 1
-        self.progress.setValue(self._current_idx)
-
-        if self._running:
-            self._process_next()
-
-    def _stop_processing(self) -> None:
-        self._running = False
-        for proc in (self._detect_process, self._trim_process):
-            if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+    proc = subprocess.Popen(
+        [FFMPEG, "-hide_banner", "-i", path,
+         "-vf", "freezedetect=n=-40dB:d=1", "-map", "0:v:0",
+         "-f", "null", "-"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    frozen = False
+    result = ""
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        if "freeze_start:" in line:
+            m = _FS_RE.search(line)
+            if m and float(m.group(1)) < 0.5:
+                frozen = True
+        elif "freeze_end:" in line and frozen:
+            m = _FE_RE.search(line)
+            if m:
+                result = seconds_to_time(float(m.group(1)))
                 proc.kill()
-                proc.waitForFinished(2000)
-        if self._tmp_path:
-            with contextlib.suppress(OSError):
-                os.unlink(self._tmp_path)
-            self._tmp_path = None
-        self._finish_all(stopped=True)
+                break
+    proc.wait()
+    return result
 
-    def _finish_all(self, stopped: bool = False) -> None:
-        self._running = False
-        self.process_btn.setEnabled(True)
-        self.add_btn.setEnabled(True)
-        self.remove_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.progress.setVisible(False)
 
-        done_n = sum(1 for s in self._statuses if s.startswith("Done"))
-        err_n = sum(1 for s in self._statuses if s.startswith("Error"))
-        msg = (
-            f"Stopped \u2014 {done_n} done, {err_n} failed."
-            if stopped
-            else f"Finished \u2014 {done_n} succeeded, {err_n} failed."
+# --------------------------------------------------------------------------
+# Trimming
+# --------------------------------------------------------------------------
+
+def build_trim_args(input_path: str, out_path: str, start: str, end: str,
+                    encoder_mode: str) -> tuple[list[str], str]:
+    """Return (ffmpeg_args, resolved_mode). end may be '' to trim to EOF."""
+    mode = encoder_mode
+    if mode == "smart":
+        mode = "copy" if start_on_keyframe(input_path, start) else smart_fallback_encoder()
+
+    if mode == "copy":
+        args = ["-y", "-ss", start]
+        if end:
+            args += ["-to", end]
+        args += ["-i", input_path, "-c", "copy", "-map", "0",
+                 "-avoid_negative_ts", "make_zero", out_path]
+    else:
+        args = ["-y", "-i", input_path, "-ss", start]
+        if end:
+            args += ["-to", end]
+        args += ["-c:v", mode] + quality_args(mode)
+        args += ["-c:a", "aac", "-b:a", "192k", "-map", "0",
+                 "-avoid_negative_ts", "make_zero", out_path]
+    return args, mode
+
+
+def trim_video(input_path: str, output_path: str, start: str, end: str,
+               encoder_mode: str, replace_source: bool,
+               on_proc=None) -> tuple[bool, str]:
+    """Run ffmpeg to trim. Returns (success, message)."""
+    if not input_path or not os.path.exists(input_path):
+        return False, "Input file not found"
+
+    if replace_source:
+        p = Path(input_path)
+        out_path = str(p.with_name(p.stem + ".vt_tmp" + p.suffix))
+    else:
+        if not output_path:
+            return False, "No output path specified"
+        if os.path.abspath(input_path) == os.path.abspath(output_path):
+            return False, 'Output equals input — enable "Overwrite source" to replace it'
+        out_path = output_path
+
+    args, mode = build_trim_args(input_path, out_path, start, end, encoder_mode)
+
+    proc = subprocess.Popen([FFMPEG, "-hide_banner"] + args,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    if on_proc:
+        on_proc(proc)
+    out = proc.stdout.read() if proc.stdout else ""
+    proc.wait()
+
+    if proc.returncode != 0:
+        if replace_source:
+            _silent_remove(out_path)
+        tail = out[-1500:] if len(out) > 1500 else out
+        return False, f"ffmpeg error (exit {proc.returncode}):\n{tail}"
+
+    if not os.path.exists(out_path):
+        return False, "ffmpeg reported success but no output file was created"
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+
+    final = out_path
+    if replace_source:
+        try:
+            os.replace(out_path, input_path)   # atomic on same filesystem
+        except OSError as e:
+            _silent_remove(out_path)
+            return False, f"Trim ok but could not replace source: {e}"
+        final = input_path
+
+    how = "lossless copy" if mode == "copy" else f"re-encoded ({mode})"
+    verb = "Replaced source" if replace_source else "Saved"
+    return True, f"Done — {how}, {verb} ({size_mb:.1f} MB): {final}"
+
+
+def _silent_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Background workers (QThread)
+# --------------------------------------------------------------------------
+
+class DetectThread(QThread):
+    done = pyqtSignal(str)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            self.done.emit(detect_first_change(self.path))
+        except Exception:
+            self.done.emit("")
+
+
+class TrimThread(QThread):
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, **params):
+        super().__init__()
+        self.params = params
+
+    def run(self):
+        ok, msg = trim_video(**self.params)
+        self.done.emit(ok, msg)
+
+
+class ScanThread(QThread):
+    progress = pyqtSignal(dict)
+    finished_rows = pyqtSignal(list)
+
+    def __init__(self, folder: str, window: float):
+        super().__init__()
+        self.folder = folder
+        self.window = window
+        self._cancel = threading.Event()
+        self._procs: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+        self._done = 0
+
+    def cancel(self):
+        self._cancel.set()
+        with self._lock:
+            for p in list(self._procs):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    def _scan_one(self, path: str) -> dict:
+        row = {"file": os.path.basename(path), "path": path,
+               "frozen": False, "first_change": "", "freeze_sec": 0.0, "error": ""}
+        if self._cancel.is_set():
+            row["error"] = "stopped"
+            return row
+        proc = subprocess.Popen(
+            [FFMPEG, "-hide_banner", "-i", path,
+             "-t", f"{self.window:.3f}", "-vf", "freezedetect=n=-40dB:d=1",
+             "-map", "0:v:0", "-an", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        self.status_label.setText(msg)
-        self.status_label.setStyleSheet(COLOR_ERROR if err_n else COLOR_SUCCESS)
+        with self._lock:
+            self._procs.add(proc)
+        err = proc.stderr.read() if proc.stderr else ""
+        proc.wait()
+        with self._lock:
+            self._procs.discard(proc)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        if self._cancel.is_set():
+            row["error"] = "stopped"
+            return row
+        if proc.returncode != 0 and "freeze" not in err:
+            row["error"] = "probe failed"
+            return row
 
-    def closeEvent(self, event) -> None:  # noqa: N802
-        self._stop_processing()
-        event.accept()
+        frozen, end, has_end = parse_initial_freeze(err)
+        if frozen:
+            row["frozen"] = True
+            if has_end:
+                row["freeze_sec"] = end
+                row["first_change"] = seconds_to_time(end)
+            else:
+                row["freeze_sec"] = self.window
+                row["first_change"] = ">" + seconds_to_time(self.window)
+        return row
+
+    def run(self):
+        files = sorted(
+            str(Path(self.folder) / e)
+            for e in os.listdir(self.folder)
+            if (Path(self.folder) / e).is_file()
+            and Path(e).suffix.lower() in VIDEO_EXTS
+        )
+        total = len(files)
+        rows: list[dict | None] = [None] * total
+        if total == 0:
+            self.finished_rows.emit([])
+            return
+
+        def work(idx: int, path: str):
+            row = self._scan_one(path)
+            rows[idx] = row
+            with self._lock:
+                self._done += 1
+                d = self._done
+            self.progress.emit({"done": d, "total": total, **row})
+
+        with ThreadPoolExecutor(max_workers=min(6, (os.cpu_count() or 2))) as ex:
+            futures = []
+            for i, path in enumerate(files):
+                if self._cancel.is_set():
+                    break
+                futures.append(ex.submit(work, i, path))
+            for _ in as_completed(futures):
+                pass
+
+        self.finished_rows.emit([r for r in rows if r])
 
 
-# ---------------------------------------------------------------------------
+class BatchThread(QThread):
+    progress = pyqtSignal(dict)
+    done = pyqtSignal(dict)
+
+    def __init__(self, items: list[dict]):
+        super().__init__()
+        self.items = items
+        self._cancel = threading.Event()
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        self._cancel.set()
+        with self._lock:
+            if self._proc:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+    def _register(self, proc):
+        with self._lock:
+            self._proc = proc
+
+    def run(self):
+        total = len(self.items)
+        succeeded = failed = 0
+        errors: list[str] = []
+        for i, it in enumerate(self.items):
+            if self._cancel.is_set():
+                break
+            ok, msg = trim_video(
+                input_path=it["path"], output_path="", start=it["start"],
+                end="", encoder_mode="smart", replace_source=True,
+                on_proc=self._register,
+            )
+            if ok:
+                succeeded += 1
+            else:
+                failed += 1
+                errors.append(f"{os.path.basename(it['path'])}: {msg}")
+            self.progress.emit({"done": i + 1, "total": total,
+                                "file": os.path.basename(it["path"]), "success": ok})
+        self.done.emit({"total": total, "succeeded": succeeded,
+                        "failed": failed, "errors": errors})
+
+
+# --------------------------------------------------------------------------
+# Scan results dialog
+# --------------------------------------------------------------------------
+
+class ScanDialog(QDialog):
+    """Table of scan results with per-file selection and batch trim."""
+
+    load_file = pyqtSignal(str, str)   # (path, start_time)
+
+    COLS = ["", "File", "Frozen intro", "First change", "Freeze (s)"]
+
+    def __init__(self, rows: list[dict], window: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Folder Freeze Scan")
+        self.resize(720, 460)
+        self.rows = rows
+        self.window = window
+        self.batch: BatchThread | None = None
+
+        v = QVBoxLayout(self)
+
+        head = QHBoxLayout()
+        frozen_n = sum(1 for r in rows if r.get("frozen") and not r.get("error"))
+        self.title = QLabel(f"{len(rows)} file(s) — {frozen_n} with a frozen intro "
+                            f"(first {window:g}s)")
+        self.title.setStyleSheet("font-weight: 600;")
+        head.addWidget(self.title)
+        head.addStretch(1)
+        self.trim_btn = QPushButton("Trim Selected (replace source)")
+        self.trim_btn.setObjectName("primary")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.hide()
+        self.close_btn = QPushButton("Close")
+        head.addWidget(self.trim_btn)
+        head.addWidget(self.stop_btn)
+        head.addWidget(self.close_btn)
+        v.addLayout(head)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: #888;")
+        v.addWidget(self.status)
+
+        self.table = QTableWidget(len(rows), len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in range(2, len(self.COLS)):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        v.addWidget(self.table, 1)
+
+        self._fill()
+
+        self.close_btn.clicked.connect(self.accept)
+        self.trim_btn.clicked.connect(self._start_batch)
+        self.stop_btn.clicked.connect(self._stop_batch)
+        self.table.cellDoubleClicked.connect(self._on_double_click)
+        self.table.itemChanged.connect(lambda _=None: self._update_trim_btn())
+        self._update_trim_btn()
+
+    def _fill(self):
+        # Frozen first, longest freeze first.
+        self.rows.sort(key=lambda r: (r.get("frozen", False), r.get("freeze_sec", 0.0)),
+                       reverse=True)
+        green, red = QColor("#4ec994"), QColor("#f14c4c")
+        for i, r in enumerate(self.rows):
+            trimmable = (r.get("frozen") and not r.get("error")
+                         and r.get("first_change") and not r["first_change"].startswith(">"))
+
+            chk = QTableWidgetItem()
+            if trimmable:
+                chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                chk.setCheckState(Qt.CheckState.Checked)
+            else:
+                chk.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            chk.setData(Qt.ItemDataRole.UserRole, i)
+            self.table.setItem(i, 0, chk)
+
+            self.table.setItem(i, 1, QTableWidgetItem(r["file"]))
+            if r.get("error"):
+                frozen_txt, change, secs = "—", r["error"], "—"
+            elif r.get("frozen"):
+                frozen_txt = "Yes"
+                change = r["first_change"]
+                secs = f"{r['freeze_sec']:.2f}"
+            else:
+                frozen_txt, change, secs = "No", "—", "0.00"
+            self.table.setItem(i, 2, QTableWidgetItem(frozen_txt))
+            self.table.setItem(i, 3, QTableWidgetItem(change))
+            self.table.setItem(i, 4, QTableWidgetItem(secs))
+
+            if r.get("error"):
+                for c in range(1, 5):
+                    self.table.item(i, c).setForeground(red)
+            elif r.get("frozen"):
+                self.table.item(i, 2).setForeground(green)
+
+    def _selected(self) -> list[dict]:
+        out = []
+        for i in range(self.table.rowCount()):
+            item = self.table.item(i, 0)
+            if item and item.flags() & Qt.ItemFlag.ItemIsUserCheckable \
+                    and item.checkState() == Qt.CheckState.Checked:
+                r = self.rows[item.data(Qt.ItemDataRole.UserRole)]
+                out.append(r)
+        return out
+
+    def _update_trim_btn(self):
+        if self.batch:
+            return
+        n = len(self._selected())
+        self.trim_btn.setEnabled(n > 0)
+        self.trim_btn.setText(f"Trim {n} Selected (replace source)" if n
+                              else "Trim Selected (replace source)")
+
+    def _on_double_click(self, row: int, _col: int):
+        r = self.rows[row]
+        start = r["first_change"] if (r.get("frozen") and r.get("first_change")
+                                      and not r["first_change"].startswith(">")) else ""
+        self.load_file.emit(r["path"], start)
+        self.accept()
+
+    def _start_batch(self):
+        rows = self._selected()
+        if not rows:
+            return
+        if QMessageBox.question(
+                self, "Trim & replace",
+                f"Trim {len(rows)} file(s) from their detected start to the end and "
+                f"REPLACE each source file?\nThis cannot be undone.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        items = [{"path": r["path"], "start": r["first_change"]} for r in rows]
+        self.trim_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.stop_btn.show()
+        self.stop_btn.setEnabled(True)
+        self.status.setText(f"Trimming {len(items)} file(s)…")
+
+        self.batch = BatchThread(items)
+        self.batch.progress.connect(self._on_batch_progress)
+        self.batch.done.connect(self._on_batch_done)
+        self.batch.start()
+
+    def _stop_batch(self):
+        if self.batch:
+            self.stop_btn.setEnabled(False)
+            self.status.setText("Stopping…")
+            self.batch.cancel()
+
+    def _on_batch_progress(self, p: dict):
+        mark = "✓" if p["success"] else "✗"
+        self.status.setText(f"Trimming {p['done']}/{p['total']}… last: {p['file']} {mark}")
+
+    def _on_batch_done(self, res: dict):
+        self.batch = None
+        self.stop_btn.hide()
+        self.close_btn.setEnabled(True)
+        msg = f"Done — {res['succeeded']} trimmed, {res['failed']} failed of {res['total']}."
+        if res["errors"]:
+            msg += "  First error: " + res["errors"][0]
+        self.status.setText(msg)
+        self._update_trim_btn()
+
+    def closeEvent(self, e):
+        if self.batch:
+            self.batch.cancel()
+            self.batch.wait(3000)
+        super().closeEvent(e)
+
+
+# --------------------------------------------------------------------------
 # Main window
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
-
-class VideoTrimWindow(QMainWindow):
-    def __init__(self) -> None:
+class VideoTrim(QMainWindow):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("VideoTrim")
-        self.setMinimumSize(700, 600)
+        self.resize(920, 720)
 
-        # Runtime state
-        self.process: QProcess | None = None
-        self._process_output: list[bytes] = []   # accumulated ffmpeg output
-        self._tmp_path: str | None = None         # temp file used for replace-source trim
-        self._detect_process: QProcess | None = None
-        self._detect_output: list[bytes] = []    # accumulated freezedetect output
-        self.video_duration_ms: int = 0
-        self.frame_duration_ms: int = 33          # default ~30 fps; updated on load
-        self._slider_pressed: bool = False
-        self._available_hw_encoders: list[tuple[str, str, str]] = (
-            _probe_available_hw_encoders()
-        )
+        self.duration_ms = 0
+        self.frame_ms = 33
+        self.info_duration_ms = 0
+        self.encoders: list[dict] = []
+        self.current_path = ""
+        self.detect_thread: DetectThread | None = None
+        self.trim_thread: TrimThread | None = None
+        self.scan_thread: ScanThread | None = None
 
         self._build_ui()
         self._setup_player()
-
-    # ------------------------------------------------------------------
-    # UI construction (split into focused helpers)
-    # ------------------------------------------------------------------
-
-    def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-
-        layout.addWidget(self._build_file_group())
-
-        self.info_label = QLabel("")
-        self.info_label.setStyleSheet(COLOR_DIM)
-        layout.addWidget(self.info_label)
-
-        layout.addWidget(self._build_video_preview(), stretch=1)
-        layout.addLayout(self._build_playback_controls())
-        layout.addWidget(self._build_trim_group())
-        layout.addWidget(self._build_encoding_group())
-        layout.addWidget(self._build_output_group())
-        layout.addWidget(self._build_trim_button())
-        layout.addWidget(self._build_progress())
-        layout.addWidget(self._build_status_label())
-
-        # Cross-widget signal wiring that needs both groups to exist
-        self.start_time.timeChanged.connect(self._update_duration_label)
-        self.end_time.timeChanged.connect(self._update_duration_label)
-
-    def _build_file_group(self) -> QGroupBox:
-        group = QGroupBox("Video File")
-        row = QHBoxLayout(group)
-
-        self.file_path = QLineEdit()
-        self.file_path.setReadOnly(True)
-        self.file_path.setPlaceholderText("No file selected")
-        row.addWidget(self.file_path, stretch=1)
-
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_file)
-        row.addWidget(browse_btn)
-
-        bulk_btn = QPushButton("Bulk…")
-        bulk_btn.setToolTip("Batch-trim multiple files using the current encoding settings")
-        bulk_btn.clicked.connect(self._open_bulk_dialog)
-        row.addWidget(bulk_btn)
-
-        return group
-
-    def _build_video_preview(self) -> QVideoWidget:
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(300)
-        return self.video_widget
-
-    def _build_playback_controls(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-
-        self.play_btn = QPushButton()
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.play_btn.setFixedWidth(40)
-        self.play_btn.clicked.connect(self._toggle_play)
-        self.play_btn.setEnabled(False)
-        row.addWidget(self.play_btn)
-
-        # Step buttons use partial so they are named callables (easier to
-        # disconnect, inspect, or extend later).
-        self.step_back_1s_btn = QPushButton("-1s")
-        self.step_back_1s_btn.setFixedWidth(40)
-        self.step_back_1s_btn.setEnabled(False)
-        self.step_back_1s_btn.clicked.connect(partial(self._step, -1000))
-        row.addWidget(self.step_back_1s_btn)
-
-        self.step_back_frame_btn = QPushButton("<")
-        self.step_back_frame_btn.setFixedWidth(30)
-        self.step_back_frame_btn.setEnabled(False)
-        self.step_back_frame_btn.clicked.connect(partial(self._step_frame, -1))
-        row.addWidget(self.step_back_frame_btn)
-
-        self.step_fwd_frame_btn = QPushButton(">")
-        self.step_fwd_frame_btn.setFixedWidth(30)
-        self.step_fwd_frame_btn.setEnabled(False)
-        self.step_fwd_frame_btn.clicked.connect(partial(self._step_frame, 1))
-        row.addWidget(self.step_fwd_frame_btn)
-
-        self.step_fwd_1s_btn = QPushButton("+1s")
-        self.step_fwd_1s_btn.setFixedWidth(40)
-        self.step_fwd_1s_btn.setEnabled(False)
-        self.step_fwd_1s_btn.clicked.connect(partial(self._step, 1000))
-        row.addWidget(self.step_fwd_1s_btn)
-
-        self.position_label = QLabel("00:00:00.000")
-        self.position_label.setFixedWidth(90)
-        row.addWidget(self.position_label)
-
-        self.scrub_slider = QSlider(Qt.Orientation.Horizontal)
-        self.scrub_slider.setRange(0, 0)
-        self.scrub_slider.setEnabled(False)
-        self.scrub_slider.sliderPressed.connect(self._on_slider_pressed)
-        self.scrub_slider.sliderReleased.connect(self._on_slider_released)
-        self.scrub_slider.sliderMoved.connect(self._on_slider_moved)
-        row.addWidget(self.scrub_slider, stretch=1)
-
-        self.total_label = QLabel("00:00:00.000")
-        self.total_label.setFixedWidth(90)
-        row.addWidget(self.total_label)
-
-        return row
-
-    def _build_trim_group(self) -> QGroupBox:
-        group = QGroupBox("Trim Range")
-        row = QHBoxLayout(group)
-
-        row.addWidget(QLabel("Start:"))
-        self.start_time = QTimeEdit()
-        self.start_time.setDisplayFormat("HH:mm:ss.zzz")
-        self.start_time.setTime(QTime(0, 0, 0, 0))
-        row.addWidget(self.start_time)
-
-        self.set_start_btn = QPushButton("Set Start")
-        self.set_start_btn.setEnabled(False)
-        self.set_start_btn.clicked.connect(self._set_start_from_player)
-        row.addWidget(self.set_start_btn)
-
-        self.detect_start_btn = QPushButton("Detect")
-        self.detect_start_btn.setEnabled(False)
-        self.detect_start_btn.setToolTip(
-            "Scan the video for the first frame change and set it as the start point"
-        )
-        self.detect_start_btn.clicked.connect(self._detect_freeze_start)
-        row.addWidget(self.detect_start_btn)
-
-        row.addSpacing(20)
-
-        row.addWidget(QLabel("End:"))
-        self.end_time = QTimeEdit()
-        self.end_time.setDisplayFormat("HH:mm:ss.zzz")
-        self.end_time.setTime(QTime(0, 0, 0, 0))
-        row.addWidget(self.end_time)
-
-        self.set_end_btn = QPushButton("Set End")
-        self.set_end_btn.setEnabled(False)
-        self.set_end_btn.clicked.connect(self._set_end_from_player)
-        row.addWidget(self.set_end_btn)
-
-        row.addSpacing(20)
-
-        self.duration_label = QLabel("")
-        self.duration_label.setStyleSheet(COLOR_DIM)
-        row.addWidget(self.duration_label)
-
-        return group
-
-    def _build_encoding_group(self) -> QGroupBox:
-        group = QGroupBox("Encoding")
-        row = QHBoxLayout(group)
-
-        row.addWidget(QLabel("Mode:"))
-        self.encoding_combo = QComboBox()
-        self.encoding_combo.addItem(ENCODING_STREAM_COPY)
-        for label, _enc, _hint in self._available_hw_encoders:
-            self.encoding_combo.addItem(label)
-        row.addWidget(self.encoding_combo, stretch=1)
-
-        self.encoding_hint = QLabel("")
-        self.encoding_hint.setStyleSheet(COLOR_DIM)
-        row.addWidget(self.encoding_hint)
-
-        self.encoding_combo.currentTextChanged.connect(self._on_encoding_changed)
-        self._on_encoding_changed(self.encoding_combo.currentText())
-
-        return group
-
-    def _build_output_group(self) -> QGroupBox:
-        group = QGroupBox("Output")
-        col = QVBoxLayout(group)
-
-        self.replace_source_cb = QCheckBox("Replace source file")
-        self.replace_source_cb.setToolTip(
-            "Trim to a temporary file, then atomically overwrite the original."
-        )
-        self.replace_source_cb.toggled.connect(self._on_replace_source_toggled)
-        col.addWidget(self.replace_source_cb)
-
-        path_row = QHBoxLayout()
-        self.output_path = QLineEdit()
-        self.output_path.setPlaceholderText("Auto-generated from input filename")
-        path_row.addWidget(self.output_path, stretch=1)
-
-        self.output_browse_btn = QPushButton("Browse…")
-        self.output_browse_btn.clicked.connect(self._browse_output)
-        path_row.addWidget(self.output_browse_btn)
-        col.addLayout(path_row)
-
-        return group
-
-    def _build_trim_button(self) -> QPushButton:
-        self.trim_btn = QPushButton("Trim Video")
-        self.trim_btn.setEnabled(False)
-        self.trim_btn.setMinimumHeight(40)
-        self.trim_btn.clicked.connect(self._trim_video)
-        return self.trim_btn
-
-    def _build_progress(self) -> QProgressBar:
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        return self.progress
-
-    def _build_status_label(self) -> QLabel:
-        self.status_label = QLabel("")
-        return self.status_label
-
-    # ------------------------------------------------------------------
-    # Player setup
-    # ------------------------------------------------------------------
-
-    def _setup_player(self) -> None:
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
-        self.player.positionChanged.connect(self._on_position_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
-        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
-        self.player.errorOccurred.connect(self._on_player_error)
-
-    # ------------------------------------------------------------------
-    # Window lifecycle
-    # ------------------------------------------------------------------
-
-    def closeEvent(self, event) -> None:  # noqa: N802
-        """Kill any in-progress ffmpeg processes before closing."""
-        for proc in (self.process, self._detect_process):
-            if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
-                proc.kill()
-                proc.waitForFinished(2000)
-        # Remove any leftover temp file from a replace-source trim.
-        if self._tmp_path:
-            with contextlib.suppress(OSError):
-                os.unlink(self._tmp_path)
-        event.accept()
-
-    # ------------------------------------------------------------------
-    # Bulk dialog
-    # ------------------------------------------------------------------
-
-    def _current_encoder_name(self) -> str:
-        """Return the raw ffmpeg encoder name for the current combo selection."""
-        text = self.encoding_combo.currentText()
-        if text == ENCODING_STREAM_COPY:
-            return "copy"
-        for _label, enc, _hint in self._available_hw_encoders:
-            if text == _label:
-                return enc
-        return "copy"
-
-    def _open_bulk_dialog(self) -> None:
-        dlg = BulkDialog(
-            self,
-            encoder_name=self._current_encoder_name(),
-            replace_source=self.replace_source_cb.isChecked(),
-        )
-        dlg.exec()
-
-    # ------------------------------------------------------------------
-    # Replace-source toggle
-    # ------------------------------------------------------------------
-
-    def _on_replace_source_toggled(self, checked: bool) -> None:
-        self.output_path.setEnabled(not checked)
-        self.output_browse_btn.setEnabled(not checked)
-        if checked:
-            self.output_path.setPlaceholderText("Will overwrite the source file")
-            self.output_path.clear()
-        else:
-            self.output_path.setPlaceholderText("Auto-generated from input filename")
-            # Restore auto-generated path if a source is already loaded.
-            src = self.file_path.text()
-            if src:
-                p = Path(src)
-                self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
-
-    # ------------------------------------------------------------------
-    # Freeze-detect start
-    # ------------------------------------------------------------------
-
-    def _detect_freeze_start(self) -> None:
-        """Run ffmpeg freezedetect and set the start time to the first frame change."""
-        input_path = self.file_path.text()
-        if not input_path:
-            return
-
-        self.detect_start_btn.setEnabled(False)
-        self.detect_start_btn.setText("Scanning\u2026")
-        self._detect_output = []
-
-        self._detect_process = QProcess(self)
-        self._detect_process.setProcessChannelMode(
-            QProcess.ProcessChannelMode.MergedChannels
-        )
-        self._detect_process.readyReadStandardOutput.connect(self._on_detect_output)
-        self._detect_process.finished.connect(self._on_detect_finished)
-        self._detect_process.start(
-            FFMPEG,
-            [
-                "-hide_banner",
-                "-i", input_path,
-                "-vf", "freezedetect=n=-40dB:d=0",
-                "-map", "0:v:0",
-                "-f", "null",
-                "-",
-            ],
-        )
-
-    def _on_detect_output(self) -> None:
-        """Buffer freezedetect output; kill early once we have a freeze_end."""
-        if self._detect_process is None:
-            return
-        chunk = self._detect_process.readAllStandardOutput().data()
-        self._detect_output.append(chunk)
-        # If we already found the answer, kill the process — no need to scan further.
-        text = b"".join(self._detect_output).decode(errors="replace")
-        if _parse_initial_freeze_end(text) is not None:
-            self._detect_process.kill()
-
-    def _on_detect_finished(self, _exit_code: int, _exit_status) -> None:
-        """Parse accumulated output and update the start time."""
-        # Drain any bytes that arrived between the last readyRead and finished.
-        if self._detect_process is not None:
-            tail = self._detect_process.readAllStandardOutput().data()
-            if tail:
-                self._detect_output.append(tail)
-
-        self._detect_process = None
-        self.detect_start_btn.setText("Detect")
-        self.detect_start_btn.setEnabled(True)
-
-        text = b"".join(self._detect_output).decode(errors="replace")
-        self._detect_output = []
-
-        freeze_end_s = _parse_initial_freeze_end(text)
-
-        if freeze_end_s is None:
-            self._set_status(
-                "No initial freeze detected \u2014 start left at 0", COLOR_DIM
-            )
-            return
-
-        freeze_end_ms = min(int(freeze_end_s * 1000), self.video_duration_ms)
-        self.start_time.setTime(ms_to_qtime(freeze_end_ms))
-        self._update_duration_label()
-        self._set_status(
-            f"Start set to {format_ms(freeze_end_ms)} (first frame change)",
-            COLOR_SUCCESS,
-        )
-
-    # ------------------------------------------------------------------
-    # Encoding combo
-    # ------------------------------------------------------------------
-
-    def _on_encoding_changed(self, text: str) -> None:
-        if text == ENCODING_STREAM_COPY:
-            self.encoding_hint.setText("Fastest — cuts on nearest keyframe, no quality loss")
-            return
-        for label, _enc, hint in self._available_hw_encoders:
-            if text == label:
-                self.encoding_hint.setText(hint)
-                return
-
-    # ------------------------------------------------------------------
-    # File browsing & video loading
-    # ------------------------------------------------------------------
-
-    def _browse_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", SUPPORTED_FORMATS)
-        if path:
-            self.file_path.setText(path)
-            self._load_video(path)
-
-    def _load_video(self, path: str) -> None:
-        # Reset stale UI state immediately so nothing from the previous file
-        # persists while the new file is being probed / loaded.
-        self._reset_player_ui()
-
-        info = get_video_info(path)
-        if info is None:
-            self.info_label.setText("Could not read video info — is ffprobe installed?")
-            self.info_label.setStyleSheet(COLOR_ERROR)
-            return
-
-        # Extract codec and FPS from the first video/audio streams found.
-        video_codec: str | None = None
-        audio_codec: str | None = None
-        for stream in info.get("streams", []):
-            codec_type = stream.get("codec_type")
-            codec_name = stream.get("codec_name")
-            if codec_type == "video" and codec_name and video_codec is None:
-                video_codec = codec_name
-                r_fps = stream.get("r_frame_rate", "")
-                if "/" in r_fps:
-                    parts = r_fps.split("/")
-                    if len(parts) == 2:
-                        try:
-                            num, den = float(parts[0]), float(parts[1])
-                            if den > 0 and num > 0:
-                                self.frame_duration_ms = round(1000.0 / (num / den))
-                        except ValueError:
-                            pass
-            elif codec_type == "audio" and codec_name and audio_codec is None:
-                audio_codec = codec_name
-
-        if video_codec is None:
-            self.info_label.setText("No video stream found in file")
-            self.info_label.setStyleSheet(COLOR_ERROR)
-            return
-
-        fmt_name = info.get("format", {}).get("format_name", "unknown")
-        audio_info = f" | Audio: {audio_codec}" if audio_codec else " | No audio"
-        self.info_label.setText(f"Format: {fmt_name} | Video: {video_codec}{audio_info}")
-        self.info_label.setStyleSheet(COLOR_DIM)
-
-        self.player.setSource(QUrl.fromLocalFile(path))
-
-        if not self.replace_source_cb.isChecked():
-            p = Path(path)
-            self.output_path.setText(str(p.with_stem(p.stem + "_trimmed")))
-
-        self._set_controls_enabled(True)
-        self.status_label.setText("")
-        self.status_label.setStyleSheet(COLOR_NORMAL)
-
-    def _reset_player_ui(self) -> None:
-        """Clear all playback-related UI to a blank state."""
-        self.player.stop()
-        self.player.setSource(QUrl())          # detach any previous source
-
-        self.frame_duration_ms = 33            # back to ~30 fps default
-        self.video_duration_ms = 0
-        self._slider_pressed = False
-
-        self.scrub_slider.setRange(0, 0)
-        self.scrub_slider.setValue(0)
-        self.position_label.setText("00:00:00.000")
-        self.total_label.setText("00:00:00.000")
-
-        self.start_time.setTime(QTime(0, 0, 0, 0))
-        self.end_time.setTime(QTime(0, 0, 0, 0))
-        self.duration_label.setText("")
-
-        self.info_label.setText("")
-        self.info_label.setStyleSheet(COLOR_DIM)
-
+        self._load_encoders()
         self._set_controls_enabled(False)
 
-    def _set_controls_enabled(self, on: bool) -> None:
-        self.play_btn.setEnabled(on)
-        self.step_back_1s_btn.setEnabled(on)
-        self.step_back_frame_btn.setEnabled(on)
-        self.step_fwd_frame_btn.setEnabled(on)
-        self.step_fwd_1s_btn.setEnabled(on)
-        self.scrub_slider.setEnabled(on)
-        self.set_start_btn.setEnabled(on)
-        self.detect_start_btn.setEnabled(on)
-        self.set_end_btn.setEnabled(on)
-        self.trim_btn.setEnabled(on)
+    # ---- UI construction -------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Player signals
-    # ------------------------------------------------------------------
+    def _group(self, title: str) -> tuple[QFrame, QVBoxLayout]:
+        box = QFrame()
+        box.setObjectName("group")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+        lbl = QLabel(title)
+        lbl.setObjectName("groupTitle")
+        lay.addWidget(lbl)
+        return box, lay
 
-    def _on_duration_changed(self, duration_ms: int) -> None:
-        self.video_duration_ms = duration_ms
-        self.scrub_slider.setRange(0, duration_ms)
-        self.total_label.setText(format_ms(duration_ms))
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
 
-        end_qtime = ms_to_qtime(duration_ms)
-        self.start_time.setTime(QTime(0, 0, 0, 0))
-        self.end_time.setTime(end_qtime)
-        self.start_time.setMaximumTime(end_qtime)
-        self.end_time.setMaximumTime(end_qtime)
+        # File
+        fbox, flay = self._group("Video File")
+        row = QHBoxLayout()
+        self.file_path = QLineEdit(); self.file_path.setReadOnly(True)
+        self.file_path.setPlaceholderText("No file selected")
+        browse = QPushButton("Browse…"); browse.clicked.connect(self._browse_file)
+        row.addWidget(self.file_path, 1); row.addWidget(browse)
+        flay.addLayout(row)
+        root.addWidget(fbox)
 
-    def _on_position_changed(self, position_ms: int) -> None:
-        self.position_label.setText(format_ms(position_ms))
-        if not self._slider_pressed:
-            self.scrub_slider.setValue(position_ms)
+        self.info_label = QLabel(""); self.info_label.setObjectName("info")
+        root.addWidget(self.info_label)
 
-    def _on_playback_state_changed(self, state) -> None:
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        # Preview
+        self.video = QVideoWidget()
+        self.video.setMinimumHeight(260)
+        self.video.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        root.addWidget(self.video, 1)
+
+        # Playback controls
+        pc = QHBoxLayout()
+        self.play_btn = QPushButton("▶"); self.play_btn.clicked.connect(self._toggle_play)
+        self.back1 = QPushButton("-1s"); self.back1.clicked.connect(lambda: self._seek_by(-1000))
+        self.backf = QPushButton("‹"); self.backf.clicked.connect(lambda: self._seek_by(-self.frame_ms))
+        self.fwdf = QPushButton("›"); self.fwdf.clicked.connect(lambda: self._seek_by(self.frame_ms))
+        self.fwd1 = QPushButton("+1s"); self.fwd1.clicked.connect(lambda: self._seek_by(1000))
+        for b in (self.play_btn, self.back1, self.backf, self.fwdf, self.fwd1):
+            b.setFixedWidth(46 if b is self.play_btn else 42)
+            pc.addWidget(b)
+        self.pos_label = QLabel("00:00:00.000"); self.pos_label.setObjectName("mono")
+        pc.addWidget(self.pos_label)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.sliderPressed.connect(lambda: setattr(self, "_dragging", True))
+        self.slider.sliderReleased.connect(self._slider_released)
+        self.slider.sliderMoved.connect(self._slider_moved)
+        self._dragging = False
+        pc.addWidget(self.slider, 1)
+        self.total_label = QLabel("00:00:00.000"); self.total_label.setObjectName("mono")
+        pc.addWidget(self.total_label)
+        root.addLayout(pc)
+
+        # Trim range
+        tbox, tlay = self._group("Trim Range")
+        tr = QHBoxLayout()
+        tr.addWidget(QLabel("Start:"))
+        self.start_in = QLineEdit("00:00:00.000"); self.start_in.setFixedWidth(110)
+        self.start_in.textChanged.connect(self._on_times_changed)
+        tr.addWidget(self.start_in)
+        self.set_start = QPushButton("Set Start"); self.set_start.clicked.connect(self._set_start)
+        tr.addWidget(self.set_start)
+        self.detect_btn = QPushButton("Detect Start"); self.detect_btn.clicked.connect(self._detect_start)
+        self.detect_btn.setToolTip("Auto-detect the first frame change (skips a frozen intro)")
+        tr.addWidget(self.detect_btn)
+        tr.addSpacing(16)
+        tr.addWidget(QLabel("End:"))
+        self.end_in = QLineEdit("00:00:00.000"); self.end_in.setFixedWidth(110)
+        self.end_in.textChanged.connect(self._on_times_changed)
+        tr.addWidget(self.end_in)
+        self.set_end = QPushButton("Set End"); self.set_end.clicked.connect(self._set_end)
+        tr.addWidget(self.set_end)
+        tr.addStretch(1)
+        self.duration_label = QLabel(""); self.duration_label.setObjectName("info")
+        tr.addWidget(self.duration_label)
+        tlay.addLayout(tr)
+        root.addWidget(tbox)
+
+        # Encoding
+        ebox, elay = self._group("Encoding")
+        er = QHBoxLayout()
+        er.addWidget(QLabel("Mode:"))
+        self.combo = QComboBox(); self.combo.currentIndexChanged.connect(self._update_hint)
+        er.addWidget(self.combo)
+        self.hint = QLabel(""); self.hint.setObjectName("info")
+        er.addWidget(self.hint, 1)
+        elay.addLayout(er)
+        root.addWidget(ebox)
+
+        # Output
+        obox, olay = self._group("Output")
+        orow = QHBoxLayout()
+        self.output_path = QLineEdit()
+        self.output_path.setPlaceholderText("Auto-generated from input filename")
+        self.output_browse = QPushButton("Browse…"); self.output_browse.clicked.connect(self._browse_output)
+        orow.addWidget(self.output_path, 1); orow.addWidget(self.output_browse)
+        olay.addLayout(orow)
+        self.overwrite = QCheckBox("Overwrite source (replace the opened file with the trimmed result)")
+        self.overwrite.toggled.connect(self._on_overwrite_toggled)
+        olay.addWidget(self.overwrite)
+        root.addWidget(obox)
+
+        # Trim button
+        self.trim_btn = QPushButton("Trim Video"); self.trim_btn.setObjectName("primary")
+        self.trim_btn.clicked.connect(self._trim)
+        root.addWidget(self.trim_btn)
+
+        # Folder freeze scan
+        sbox, slay = self._group("Folder Freeze Scan")
+        sr = QHBoxLayout()
+        self.scan_btn = QPushButton("Scan Folder…"); self.scan_btn.clicked.connect(self._scan_folder)
+        self.scan_stop = QPushButton("Stop"); self.scan_stop.setEnabled(False)
+        self.scan_stop.clicked.connect(self._stop_scan)
+        sr.addWidget(self.scan_btn); sr.addWidget(self.scan_stop)
+        sr.addWidget(QLabel("First"))
+        self.scan_window = QSpinBox(); self.scan_window.setRange(1, 120); self.scan_window.setValue(10)
+        self.scan_window.setFixedWidth(60)
+        sr.addWidget(self.scan_window); sr.addWidget(QLabel("sec"))
+        self.log_toggle = QCheckBox("Log"); self.log_toggle.toggled.connect(self._toggle_log)
+        sr.addWidget(self.log_toggle)
+        self.scan_status = QLabel(""); self.scan_status.setObjectName("info")
+        sr.addWidget(self.scan_status, 1)
+        slay.addLayout(sr)
+        self.scan_log = QPlainTextEdit(); self.scan_log.setReadOnly(True)
+        self.scan_log.setObjectName("log"); self.scan_log.setFixedHeight(120)
+        self.scan_log.hide()
+        slay.addWidget(self.scan_log)
+        root.addWidget(sbox)
+
+        # Status
+        self.status = QLabel(""); self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+
+    # ---- Player ----------------------------------------------------------
+
+    def _setup_player(self):
+        self.player = QMediaPlayer()
+        self.audio = QAudioOutput()
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video)
+        self.player.positionChanged.connect(self._on_position)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.playbackStateChanged.connect(self._on_playback_state)
+        self.player.errorOccurred.connect(self._on_player_error)
+
+    # ---- Encoders --------------------------------------------------------
+
+    def _load_encoders(self):
+        self.encoders = available_encoders()
+        self.combo.clear()
+        self.combo.addItem("Smart (recommended — lossless when possible)", "smart")
+        self.combo.addItem("Stream Copy (fast, no re-encoding)", "copy")
+        for e in self.encoders:
+            self.combo.addItem(e["label"], e["encoder"])
+        self._update_hint()
+
+    def _update_hint(self):
+        val = self.combo.currentData()
+        if val == "smart":
+            self.hint.setText("Lossless copy when start is on a keyframe; else a near-lossless "
+                              "hardware re-encode for a frame-accurate cut")
+        elif val == "copy":
+            self.hint.setText("Fastest — cuts on nearest keyframe, no quality loss")
         else:
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            e = next((x for x in self.encoders if x["encoder"] == val), None)
+            self.hint.setText(e["hint"] if e else "")
 
-    def _on_player_error(self, error, error_string: str) -> None:
-        """Show a non-blocking warning when Qt's media player can't decode a file."""
-        # Media errors are common for formats the OS codec pack doesn't support
-        # (e.g. HEVC on Windows without the HEVC Video Extensions).
-        # Trimming via ffmpeg still works even if preview fails.
-        self._set_status(
-            f"Preview unavailable: {error_string} "
-            "(trimming still works — ffmpeg handles all formats)",
-            COLOR_ERROR,
-        )
+    # ---- Enable / disable ------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Scrub slider
-    # ------------------------------------------------------------------
+    def _set_controls_enabled(self, on: bool):
+        for w in (self.play_btn, self.back1, self.backf, self.fwdf, self.fwd1,
+                  self.set_start, self.set_end, self.detect_btn, self.trim_btn, self.slider):
+            w.setEnabled(on)
 
-    def _on_slider_pressed(self) -> None:
-        self._slider_pressed = True
+    # ---- File load -------------------------------------------------------
 
-    def _on_slider_released(self) -> None:
-        self._slider_pressed = False
-        self.player.setPosition(self.scrub_slider.value())
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video", "",
+            "Video Files (*.mp4 *.mkv *.avi *.mov *.ts *.flv *.wmv *.webm *.m4v *.mpg *.mpeg *.3gp);;All Files (*)")
+        if path:
+            self.load_video(path)
 
-    def _on_slider_moved(self, position_ms: int) -> None:
-        self.position_label.setText(format_ms(position_ms))
-        self.player.setPosition(position_ms)
+    def load_video(self, path: str, preset_start: str = ""):
+        self.current_path = path
+        self.file_path.setText(path)
+        self._show_status("", "")
+        self.info_label.setText("Loading…")
 
-    # ------------------------------------------------------------------
-    # Playback controls
-    # ------------------------------------------------------------------
+        info = get_video_info(path)
+        if info.get("error"):
+            self.info_label.setText("Error: " + info["error"])
+            self._set_controls_enabled(False)
+            return
 
-    def _toggle_play(self) -> None:
+        audio = f" | Audio: {info['acodec']}" if info["acodec"] else " | No audio"
+        self.info_label.setText(f"Format: {info['format']} | Video: {info['vcodec']}{audio}")
+        if info["fps"] > 0:
+            self.frame_ms = max(1, round(1000 / info["fps"]))
+        self.info_duration_ms = info["duration_ms"]
+
+        self.player.setSource(QUrl.fromLocalFile(path))
+        if Path(path).suffix.lower() not in PREVIEWABLE:
+            self._show_status("Preview may not display this format; trimming still works.", "")
+
+        self.output_path.setText(str(Path(path).with_name(Path(path).stem + "_trimmed" + Path(path).suffix)))
+        self._set_controls_enabled(True)
+
+        if preset_start:
+            self.start_in.setText(preset_start)
+        self._on_times_changed()
+
+    # ---- Player events ---------------------------------------------------
+
+    def _on_duration(self, ms: int):
+        self.duration_ms = ms if ms > 0 else self.info_duration_ms
+        self.slider.setRange(0, self.duration_ms)
+        self.total_label.setText(ms_to_time(self.duration_ms))
+        if time_to_ms(self.end_in.text()) <= 0 or self.end_in.text() == "00:00:00.000":
+            self.end_in.setText(ms_to_time(self.duration_ms))
+        self._on_times_changed()
+
+    def _on_position(self, ms: int):
+        if self._dragging:
+            return
+        self.pos_label.setText(ms_to_time(ms))
+        self.slider.setValue(ms)
+
+    def _on_playback_state(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_btn.setText("⏸" if playing else "▶")
+
+    def _on_player_error(self, _err, msg):
+        if msg:
+            self._show_status("Preview: " + msg + " (trimming still works)", "error")
+
+    # ---- Playback --------------------------------------------------------
+
+    def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
             self.player.play()
 
-    def _step(self, delta_ms: int) -> None:
+    def _seek_by(self, delta_ms: int):
         self.player.pause()
-        new_pos = max(0, min(self.player.position() + delta_ms, self.video_duration_ms))
-        self.player.setPosition(new_pos)
+        new = max(0, min(self.player.position() + delta_ms, self.duration_ms))
+        self.player.setPosition(new)
 
-    def _step_frame(self, frames: int) -> None:
-        self._step(frames * self.frame_duration_ms)
+    def _slider_released(self):
+        self._dragging = False
+        self.player.setPosition(self.slider.value())
 
-    def _set_start_from_player(self) -> None:
-        self.start_time.setTime(ms_to_qtime(self.player.position()))
+    def _slider_moved(self, val: int):
+        self.pos_label.setText(ms_to_time(val))
 
-    def _set_end_from_player(self) -> None:
-        self.end_time.setTime(ms_to_qtime(self.player.position()))
+    # ---- Trim range ------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Trim range label
-    # ------------------------------------------------------------------
+    def _set_start(self):
+        self.start_in.setText(ms_to_time(self.player.position()))
 
-    def _update_duration_label(self) -> None:
-        start_ms = qtime_to_ms(self.start_time.time())
-        end_ms = qtime_to_ms(self.end_time.time())
-        diff_ms = end_ms - start_ms
-        if diff_ms > 0:
-            self.duration_label.setText(f"Duration: {format_ms(diff_ms)}")
+    def _set_end(self):
+        self.end_in.setText(ms_to_time(self.player.position()))
+
+    def _on_times_changed(self):
+        s, e = time_to_ms(self.start_in.text()), time_to_ms(self.end_in.text())
+        self.start_in.setStyleSheet("" if s >= 0 else "border:1px solid #f14c4c;")
+        self.end_in.setStyleSheet("" if e >= 0 else "border:1px solid #f14c4c;")
+        if s < 0 or e < 0:
+            self.duration_label.setText("Invalid time format")
+        elif e - s > 0:
+            self.duration_label.setText("Duration: " + ms_to_time(e - s))
         else:
             self.duration_label.setText("Invalid range")
 
-    # ------------------------------------------------------------------
-    # Output browsing
-    # ------------------------------------------------------------------
+    def _detect_start(self):
+        if not self.current_path:
+            return
+        self.detect_btn.setEnabled(False)
+        self.detect_btn.setText("Detecting…")
+        self._show_status("Detecting first frame change…", "")
+        self.detect_thread = DetectThread(self.current_path)
+        self.detect_thread.done.connect(self._on_detect_done)
+        self.detect_thread.start()
 
-    def _browse_output(self) -> None:
-        current = self.output_path.text()
-        start_dir = str(Path(current).parent) if current else ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save As", start_dir, SUPPORTED_FORMATS)
+    def _on_detect_done(self, ts: str):
+        self.detect_btn.setEnabled(True)
+        self.detect_btn.setText("Detect Start")
+        if ts:
+            self.start_in.setText(ts)
+            self.player.setPosition(time_to_ms(ts))
+            self._show_status("First frame change at " + ts + " — start set", "success")
+        else:
+            self._show_status("No frozen intro detected — start left unchanged.", "")
+
+    # ---- Output ----------------------------------------------------------
+
+    def _browse_output(self):
+        start_dir = str(Path(self.output_path.text()).parent) if self.output_path.text() else ""
+        path, _ = QFileDialog.getSaveFileName(self, "Save As", start_dir,
+                                              "Video Files (*.mp4 *.mkv *.mov *.m4v);;All Files (*)")
         if path:
             self.output_path.setText(path)
 
-    # ------------------------------------------------------------------
-    # Trim
-    # ------------------------------------------------------------------
+    def _on_overwrite_toggled(self, on: bool):
+        self.output_path.setDisabled(on)
+        self.output_browse.setDisabled(on)
 
-    def _trim_video(self) -> None:
-        input_path = self.file_path.text()
-        replace_source = self.replace_source_cb.isChecked()
+    # ---- Trim ------------------------------------------------------------
 
-        if not input_path or not os.path.isfile(input_path):
-            QMessageBox.warning(self, "Error", "Please select a valid input file.")
-            return
+    def _trim(self):
+        inp = self.current_path
+        replace = self.overwrite.isChecked()
+        out = self.output_path.text().strip()
+        if not inp:
+            self._show_status("Select a valid input file.", "error"); return
+        if not replace and not out:
+            self._show_status("Specify an output file path.", "error"); return
 
-        start_ms = qtime_to_ms(self.start_time.time())
-        end_ms = qtime_to_ms(self.end_time.time())
+        s, e = time_to_ms(self.start_in.text()), time_to_ms(self.end_in.text())
+        if s < 0 or e < 0:
+            self._show_status("Invalid time format.", "error"); return
+        if s >= e:
+            self._show_status("End time must be after start time.", "error"); return
 
-        if start_ms >= end_ms:
-            QMessageBox.warning(self, "Error", "End time must be after start time.")
-            return
-
-        if replace_source:
-            reply = QMessageBox.question(
-                self,
-                "Replace Source File",
-                f"This will permanently overwrite '{Path(input_path).name}' "
-                f"with the trimmed version.\n\nContinue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+        if replace:
+            if QMessageBox.question(
+                    self, "Overwrite source",
+                    f'Overwrite the source file "{Path(inp).name}" with the trimmed result?\n'
+                    "This cannot be undone.") != QMessageBox.StandardButton.Yes:
                 return
-            # Trim to a temp file in the same directory so os.replace() is
-            # guaranteed to be on the same filesystem (atomic rename).
-            ext = Path(input_path).suffix
-            fd, tmp_path = tempfile.mkstemp(
-                suffix=ext, dir=str(Path(input_path).parent)
-            )
-            os.close(fd)
-            self._tmp_path = tmp_path
-            effective_output = tmp_path
-        else:
-            output_path = self.output_path.text().strip()
-            if not output_path:
-                QMessageBox.warning(self, "Error", "Please specify an output file path.")
+        elif os.path.exists(out):
+            if QMessageBox.question(self, "File exists",
+                                    f'"{Path(out).name}" already exists. Overwrite?') \
+                    != QMessageBox.StandardButton.Yes:
                 return
-            if os.path.abspath(input_path) == os.path.abspath(output_path):
-                QMessageBox.warning(
-                    self, "Error", "Output file cannot be the same as input file."
-                )
-                return
-            if os.path.exists(output_path):
-                reply = QMessageBox.question(
-                    self,
-                    "File Exists",
-                    f"'{Path(output_path).name}' already exists. Overwrite?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-            self._tmp_path = None
-            effective_output = output_path
 
         self.player.pause()
-
-        start = qtime_to_ffmpeg(self.start_time.time())
-        end = qtime_to_ffmpeg(self.end_time.time())
-        mode = self.encoding_combo.currentText()
-
-        if mode == ENCODING_STREAM_COPY:
-            # Input seeking: fast, cuts on the nearest keyframe.
-            cmd = [
-                FFMPEG, "-y",
-                "-ss", start,
-                "-to", end,
-                "-i", input_path,
-                "-c", "copy",
-                "-map", "0",
-                "-avoid_negative_ts", "make_zero",
-                effective_output,
-            ]
-        else:
-            # Output seeking: frame-accurate re-encode.
-            video_codec: str | None = None
-            for label, enc, _hint in self._available_hw_encoders:
-                if mode == label:
-                    video_codec = enc
-                    break
-
-            if video_codec is None:
-                # This should not happen in normal use, but guard against it
-                # to avoid a TypeError from the "in" check below.
-                QMessageBox.warning(self, "Error", "Unknown encoder mode selected.")
-                return
-
-            quality_args: list[str] = []
-            if "videotoolbox" in video_codec:
-                quality_args = ["-q:v", "65"]
-            elif "qsv" in video_codec:
-                quality_args = ["-global_quality", "18"]
-
-            cmd = [
-                FFMPEG, "-y",
-                "-i", input_path,
-                "-ss", start,
-                "-to", end,
-                "-c:v", video_codec,
-                *quality_args,
-                "-c:a", "aac",
-                "-map", "0",
-                "-avoid_negative_ts", "make_zero",
-                effective_output,
-            ]
-
         self.trim_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)   # indeterminate
-        self._set_status("Trimming…", COLOR_NORMAL)
-
-        self._process_output = []      # reset accumulator for this run
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-
-        # Drain stdout/stderr continuously so the buffer stays small even for
-        # very long transcodes and all output is available on error.
-        self.process.readyReadStandardOutput.connect(self._on_process_output)
-
-        self.process.finished.connect(self._on_process_finished)
-        self.process.start(cmd[0], cmd[1:])
-
-    def _on_process_output(self) -> None:
-        """Drain the QProcess output buffer as data arrives."""
-        if self.process is not None:
-            chunk = self.process.readAllStandardOutput().data()
-            self._process_output.append(chunk)
-
-    def _on_process_finished(self, exit_code: int, _exit_status) -> None:
-        self.progress.setVisible(False)
-        self.trim_btn.setEnabled(True)
-
-        tmp_path = self._tmp_path
-        self._tmp_path = None
-        self.process = None
-        self._process_output_buf = b"".join(self._process_output)
-        self._process_output = []
-
-        if tmp_path is not None:
-            # Replace-source mode: move the temp file over the original.
-            self._finish_replace_source(exit_code, tmp_path)
-        else:
-            self._finish_normal(exit_code)
-
-    def _finish_replace_source(self, exit_code: int, tmp_path: str) -> None:
-        """Handle process completion when the replace-source option was used."""
-        input_path = self.file_path.text()
-
-        if exit_code != 0:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            tail = self._ffmpeg_tail()
-            self._set_status(f"ffmpeg failed (exit code {exit_code})", COLOR_ERROR)
-            QMessageBox.critical(self, "ffmpeg Error", tail)
-            return
-
-        if not os.path.isfile(tmp_path):
-            self._set_status(
-                "ffmpeg reported success but temp file was not created.", COLOR_ERROR
-            )
-            return
-
-        try:
-            os.replace(tmp_path, input_path)   # atomic on same filesystem
-        except OSError as exc:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            self._set_status(
-                f"Trim succeeded but could not replace source: {exc}", COLOR_ERROR
-            )
-            return
-
-        size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        self._set_status(
-            f"Done! Replaced ({size_mb:.1f} MB): {input_path}", COLOR_SUCCESS
+        self._show_status("Trimming…", "")
+        self.trim_thread = TrimThread(
+            input_path=inp, output_path="" if replace else out,
+            start=ms_to_time(s), end=ms_to_time(e),
+            encoder_mode=self.combo.currentData(), replace_source=replace,
         )
+        self._trim_replaced = replace
+        self.trim_thread.done.connect(self._on_trim_done)
+        self.trim_thread.start()
 
-        # Reload the player so scrub bar and duration reflect the trimmed file.
-        self.player.stop()
-        self.player.setSource(QUrl())
-        self.player.setSource(QUrl.fromLocalFile(input_path))
+    def _on_trim_done(self, ok: bool, msg: str):
+        self.trim_btn.setEnabled(True)
+        self._show_status(msg, "success" if ok else "error")
+        if ok and self._trim_replaced:
+            self.player.setSource(QUrl())
+            self.player.setSource(QUrl.fromLocalFile(self.current_path))
 
-    def _finish_normal(self, exit_code: int) -> None:
-        """Handle process completion for a normal (new-file) trim."""
-        output_path = self.output_path.text()
+    # ---- Folder scan -----------------------------------------------------
 
-        if exit_code == 0 and os.path.isfile(output_path):
-            size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            self._set_status(
-                f"Done! Saved ({size_mb:.1f} MB): {output_path}", COLOR_SUCCESS
-            )
-        elif exit_code == 0:
-            self._set_status(
-                "ffmpeg reported success but output file was not created.", COLOR_ERROR
-            )
+    def _toggle_log(self, on: bool):
+        self.scan_log.setVisible(on)
+
+    def _scan_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
+        if not folder:
+            return
+        self.scan_btn.setEnabled(False)
+        self.scan_stop.setEnabled(True)
+        self.scan_log.clear()
+        self.scan_status.setText("Scanning…")
+        self.scan_thread = ScanThread(folder, float(self.scan_window.value()))
+        self.scan_thread.progress.connect(self._on_scan_progress)
+        self.scan_thread.finished_rows.connect(self._on_scan_done)
+        self.scan_thread.start()
+
+    def _stop_scan(self):
+        if self.scan_thread:
+            self.scan_stop.setEnabled(False)
+            self.scan_status.setText("Stopping…")
+            self.scan_thread.cancel()
+
+    def _on_scan_progress(self, p: dict):
+        self.scan_status.setText(f"Scanning… {p['done']}/{p['total']}")
+        if p.get("error"):
+            result = f"⚠ {p['error']}"
+        elif p.get("frozen"):
+            result = f"frozen → {p['first_change']} ({p['freeze_sec']:.2f}s)"
         else:
-            tail = self._ffmpeg_tail()
-            self._set_status(f"ffmpeg failed (exit code {exit_code})", COLOR_ERROR)
-            QMessageBox.critical(self, "ffmpeg Error", tail)
+            result = "no freeze"
+        self.scan_log.appendPlainText(f"[{p['done']}/{p['total']}] {p['file']} — {result}")
 
-    def _ffmpeg_tail(self) -> str:
-        """Return the last 2000 chars of the accumulated ffmpeg output."""
-        full = self._process_output_buf.decode(errors="replace")
-        return full[-2000:] if len(full) > 2000 else full
+    def _on_scan_done(self, rows: list):
+        self.scan_btn.setEnabled(True)
+        self.scan_stop.setEnabled(False)
+        self.scan_thread = None
+        if not rows:
+            self.scan_status.setText("No video files found (or scan stopped before any completed).")
+            return
+        frozen_n = sum(1 for r in rows if r.get("frozen") and not r.get("error"))
+        win = self.scan_window.value()
+        self.scan_status.setText(f"{len(rows)} file(s) — {frozen_n} with a frozen intro (first {win}s).")
+        dlg = ScanDialog(rows, float(win), self)
+        dlg.load_file.connect(self.load_video)
+        dlg.exec()
 
-    # ------------------------------------------------------------------
-    # Status helper
-    # ------------------------------------------------------------------
+    # ---- Status ----------------------------------------------------------
 
-    def _set_status(self, message: str, style: str) -> None:
-        self.status_label.setText(message)
-        self.status_label.setStyleSheet(style)
+    def _show_status(self, msg: str, kind: str):
+        color = {"success": "#4ec994", "error": "#f14c4c"}.get(kind, "#888")
+        self.status.setStyleSheet(f"color: {color};")
+        self.status.setText(msg)
+
+    def closeEvent(self, e):
+        for t in (self.scan_thread, self.trim_thread, self.detect_thread):
+            if t and t.isRunning():
+                if hasattr(t, "cancel"):
+                    t.cancel()
+                t.wait(2000)
+        super().closeEvent(e)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+STYLE = """
+* { font-size: 13px; }
+QMainWindow, QWidget { background: #1e1e1e; color: #cccccc; }
+QFrame#group { border: 1px solid #3f3f46; border-radius: 4px; background: #252526; }
+QLabel#groupTitle { color: #cccccc; font-weight: 600; }
+QLabel#info { color: #888888; font-size: 12px; }
+QLabel#mono { color: #cccccc; font-family: Menlo, monospace; }
+QLabel#status { color: #888888; font-size: 12px; }
+QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
+    background: #2d2d30; border: 1px solid #3f3f46; border-radius: 3px;
+    padding: 4px 6px; color: #cccccc;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #0e7ad1; }
+QPlainTextEdit#log { font-family: Menlo, monospace; font-size: 11px; color: #888; }
+QPushButton {
+    background: #3a3a3c; border: 1px solid #3f3f46; border-radius: 3px;
+    padding: 5px 12px; color: #eee;
+}
+QPushButton:hover { background: #4a4a4e; }
+QPushButton:disabled { color: #666; background: #303032; }
+QPushButton#primary { background: #0e7ad1; border-color: #0e7ad1; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #1589e4; }
+QPushButton#primary:disabled { background: #2a4a63; color: #99b; }
+QTableWidget { background: #252526; gridline-color: #3f3f46; }
+QHeaderView::section { background: #2d2d30; color: #888; border: none; padding: 5px 8px; }
+QSlider::groove:horizontal { height: 4px; background: #3f3f46; border-radius: 2px; }
+QSlider::handle:horizontal { width: 12px; background: #0e7ad1; border-radius: 6px; margin: -5px 0; }
+"""
 
 
-def main() -> None:
+def main():
+    if FFMPEG == "ffmpeg" and not shutil.which("ffmpeg"):
+        pass  # resolved lazily; error surfaces on first use
     app = QApplication(sys.argv)
-    app.setApplicationName("VideoTrim")
-    window = VideoTrimWindow()
-    window.show()
+    app.setStyleSheet(STYLE)
+    win = VideoTrim()
+    win.show()
     sys.exit(app.exec())
 
 

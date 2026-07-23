@@ -86,6 +86,12 @@ winget install ffmpeg
 
 ## Python + PyQt6 version (`videotrim.py`)
 
+macOS / Apple Silicon build with full feature parity to the Wails app:
+Smart / Stream-Copy / VideoToolbox trimming, Detect Start, Overwrite source,
+and the Folder Freeze Scan (table + batch-trim selected files in place, with a
+live log and Stop). Hardware encoding is Apple VideoToolbox; software x264 is
+the fallback.
+
 ### Requirements
 
 - **Python** 3.10+
