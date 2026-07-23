@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function AutoOutputPath(arg1:string):Promise<string>;
 
+export function Confirm(arg1:string,arg2:string):Promise<boolean>;
+
 export function DetectFirstChange(arg1:string):Promise<string>;
 
 export function FileExists(arg1:string):Promise<boolean>;

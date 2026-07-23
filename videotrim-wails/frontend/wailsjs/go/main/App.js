@@ -6,6 +6,10 @@ export function AutoOutputPath(arg1) {
   return window['go']['main']['App']['AutoOutputPath'](arg1);
 }
 
+export function Confirm(arg1, arg2) {
+  return window['go']['main']['App']['Confirm'](arg1, arg2);
+}
+
 export function DetectFirstChange(arg1) {
   return window['go']['main']['App']['DetectFirstChange'](arg1);
 }

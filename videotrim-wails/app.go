@@ -445,6 +445,26 @@ func (a *App) FileExists(path string) bool {
 	return err == nil
 }
 
+// Confirm shows a native yes/no dialog and returns true if the user confirms.
+// Used instead of the webview's window.confirm(), which WKWebView on macOS does
+// not reliably handle (it silently resolves to false).
+func (a *App) Confirm(title, message string) bool {
+	sel, err := wailsruntime.MessageDialog(a.ctx, wailsruntime.MessageDialogOptions{
+		Type:          wailsruntime.QuestionDialog,
+		Title:         title,
+		Message:       message,
+		Buttons:       []string{"Yes", "No"},
+		DefaultButton: "Yes",
+		CancelButton:  "No",
+	})
+	if err != nil {
+		return false
+	}
+	// On macOS the returned value is the button label; treat anything but an
+	// explicit "No"/"Cancel" as confirmation to be robust across platforms.
+	return sel != "No" && sel != "Cancel" && sel != ""
+}
+
 // TrimVideo runs ffmpeg to trim the video with the given parameters.
 func (a *App) TrimVideo(params TrimParams) TrimResult {
 	if params.InputPath == "" {

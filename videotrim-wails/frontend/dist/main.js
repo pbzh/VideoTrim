@@ -363,12 +363,14 @@ trimBtn.addEventListener('click', async () => {
 
   if (replace) {
     const name = input.split(/[/\\]/).pop();
-    if (!confirm(`Overwrite the source file "${name}" with the trimmed result?\nThis cannot be undone.`)) return;
+    const ok = await go.Confirm('Overwrite source', `Overwrite the source file "${name}" with the trimmed result? This cannot be undone.`);
+    if (!ok) return;
   } else {
     const exists = await go.FileExists(output);
     if (exists) {
       const name = output.split(/[/\\]/).pop();
-      if (!confirm(`"${name}" already exists. Overwrite?`)) return;
+      const ok = await go.Confirm('File exists', `"${name}" already exists. Overwrite?`);
+      if (!ok) return;
     }
   }
 
