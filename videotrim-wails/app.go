@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -256,11 +257,15 @@ func lastFloatAfter(line, marker string) (float64, bool) {
 // DetectFirstChange finds the timestamp of the first real frame change (end of
 // an initial frozen/static intro) and returns it as HH:MM:SS.mmm. Returns an
 // empty string when the video does not start with a freeze.
+//
+// ffmpeg's freezedetect logs the freeze boundaries to stderr as it decodes.
+// We stream that output and kill ffmpeg the moment the first freeze_end is
+// found, so detection only decodes up to the first frame change instead of the
+// whole file — the difference between ~2s and minutes on a long video.
 func (a *App) DetectFirstChange(path string) string {
 	if path == "" {
 		return ""
 	}
-	// freezedetect logs to stderr; -f null discards the decoded output.
 	cmd := exec.Command(ffmpegBin(),
 		"-hide_banner",
 		"-i", path,
@@ -268,12 +273,28 @@ func (a *App) DetectFirstChange(path string) string {
 		"-map", "0:v:0",
 		"-f", "null", "-",
 	)
-	out, _ := cmd.CombinedOutput() // non-zero exit is fine; we parse the log
-	secs := parseInitialFreezeEnd(string(out))
-	if secs <= 0 {
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
 		return ""
 	}
-	return secondsToTime(secs)
+	if err := cmd.Start(); err != nil {
+		return ""
+	}
+
+	var buf strings.Builder
+	var result string
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		buf.WriteString(scanner.Text())
+		buf.WriteByte('\n')
+		if secs := parseInitialFreezeEnd(buf.String()); secs > 0 {
+			result = secondsToTime(secs)
+			_ = cmd.Process.Kill() // stop decoding immediately
+			break
+		}
+	}
+	_ = cmd.Wait() // reap the process (killed or finished)
+	return result
 }
 
 // secondsToTime formats seconds as HH:MM:SS.mmm.
