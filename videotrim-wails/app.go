@@ -307,7 +307,7 @@ func (a *App) DetectFirstChange(path string) string {
 	cmd := exec.Command(ffmpegBin(),
 		"-hide_banner",
 		"-i", path,
-		"-vf", "freezedetect=n=-40dB:d=0",
+		"-vf", "freezedetect=n=-40dB:d=1",
 		"-map", "0:v:0",
 		"-f", "null", "-",
 	)
@@ -355,7 +355,7 @@ func scanFreeze(ctx context.Context, path string, windowSec float64) ScanRow {
 		"-hide_banner",
 		"-i", path,
 		"-t", strconv.FormatFloat(windowSec, 'f', 3, 64),
-		"-vf", "freezedetect=n=-40dB:d=0",
+		"-vf", "freezedetect=n=-40dB:d=1",
 		"-map", "0:v:0",
 		"-an",
 		"-f", "null", "-",
