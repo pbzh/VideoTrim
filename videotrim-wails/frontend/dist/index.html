@@ -114,12 +114,20 @@
     <div class="modal">
       <div class="modal-head">
         <span id="scan-modal-title" class="group-title">Folder Freeze Scan</span>
-        <button id="scan-close-btn" class="btn btn-sm">Close</button>
+        <div class="modal-actions">
+          <button id="batch-trim-btn" class="btn btn-primary btn-sm">Trim Selected (replace source)</button>
+          <button id="batch-stop-btn" class="btn btn-sm hidden">Stop</button>
+          <button id="scan-close-btn" class="btn btn-sm">Close</button>
+        </div>
       </div>
+      <div id="batch-status" class="info-text"></div>
       <div class="scan-results">
         <table class="scan-table">
           <thead>
-            <tr><th>File</th><th>Frozen intro</th><th>First change</th><th>Freeze (s)</th></tr>
+            <tr>
+              <th class="scan-check"><input type="checkbox" id="scan-check-all" title="Select all trimmable" /></th>
+              <th>File</th><th>Frozen intro</th><th>First change</th><th>Freeze (s)</th>
+            </tr>
           </thead>
           <tbody id="scan-tbody"></tbody>
         </table>

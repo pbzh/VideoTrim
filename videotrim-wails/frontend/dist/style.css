@@ -317,6 +317,10 @@ label { color: var(--dim); white-space: nowrap; }
   gap: 12px;
   margin-bottom: 8px;
 }
+.modal-actions { display: flex; align-items: center; gap: 8px; }
+#batch-status { min-height: 15px; margin-bottom: 6px; }
+.scan-check { width: 30px; text-align: center; }
+.scan-check input { cursor: pointer; }
 
 .scan-results {
   overflow: auto;

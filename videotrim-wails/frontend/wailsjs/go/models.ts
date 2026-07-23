@@ -1,5 +1,37 @@
 export namespace main {
 	
+	export class BatchItem {
+	    path: string;
+	    startTime: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new BatchItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.startTime = source["startTime"];
+	    }
+	}
+	export class BatchTrimResult {
+	    total: number;
+	    succeeded: number;
+	    failed: number;
+	    errors?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new BatchTrimResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.total = source["total"];
+	        this.succeeded = source["succeeded"];
+	        this.failed = source["failed"];
+	        this.errors = source["errors"];
+	    }
+	}
 	export class EncoderInfo {
 	    label: string;
 	    encoder: string;

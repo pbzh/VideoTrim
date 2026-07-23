@@ -487,6 +487,82 @@ scanStopBtn.addEventListener('click', async () => {
   await go.StopScan();
 });
 
+// --- Batch trim (from scan results) ---
+
+const batchTrimBtn = el('batch-trim-btn');
+const batchStopBtn = el('batch-stop-btn');
+const batchStatus  = el('batch-status');
+const scanCheckAll = el('scan-check-all');
+
+function rowChecks() {
+  return Array.from(scanTbody.querySelectorAll('.scan-row-check'));
+}
+function selectedRows() {
+  return rowChecks().filter(cb => cb.checked).map(cb => cb._row);
+}
+function updateBatchButton() {
+  const checks = rowChecks();
+  const sel = checks.filter(cb => cb.checked).length;
+  batchTrimBtn.disabled = sel === 0;
+  batchTrimBtn.textContent = sel > 0
+    ? `Trim ${sel} Selected (replace source)`
+    : 'Trim Selected (replace source)';
+  scanCheckAll.checked = checks.length > 0 && sel === checks.length;
+  scanCheckAll.indeterminate = sel > 0 && sel < checks.length;
+}
+
+scanCheckAll.addEventListener('change', () => {
+  rowChecks().forEach(cb => { cb.checked = scanCheckAll.checked; });
+  updateBatchButton();
+});
+
+if (window.runtime && window.runtime.EventsOn) {
+  window.runtime.EventsOn('batch:progress', p => {
+    if (!p || !p.total) return;
+    batchStatus.textContent = `Trimming ${p.done}/${p.total}… last: ${p.file} ${p.success ? '✓' : '✗'}`;
+  });
+}
+
+batchTrimBtn.addEventListener('click', async () => {
+  const rows = selectedRows();
+  if (rows.length === 0) return;
+
+  const ok = await go.Confirm('Trim & replace',
+    `Trim ${rows.length} file(s) from their detected start to the end and REPLACE each source file? This cannot be undone.`);
+  if (!ok) return;
+
+  const items = rows.map(r => ({ path: r.path, startTime: r.firstChange }));
+
+  batchTrimBtn.disabled = true;
+  scanCloseBtn.disabled = true;
+  batchStopBtn.classList.remove('hidden');
+  batchStopBtn.disabled = false;
+  batchStatus.textContent = `Trimming ${items.length} file(s)…`;
+
+  try {
+    const res = await go.BatchTrim(items);
+    let msg = `Done — ${res.succeeded} trimmed, ${res.failed} failed of ${res.total}.`;
+    if (res.errors && res.errors.length) msg += ' First error: ' + res.errors[0];
+    batchStatus.textContent = msg;
+    // If the currently-open file was among them, reload its preview.
+    if (filePath.value && rows.some(r => r.path === filePath.value)) {
+      await loadVideo(filePath.value);
+    }
+  } catch (e) {
+    batchStatus.textContent = 'Batch trim failed: ' + String(e);
+  } finally {
+    batchStopBtn.classList.add('hidden');
+    scanCloseBtn.disabled = false;
+    updateBatchButton();
+  }
+});
+
+batchStopBtn.addEventListener('click', async () => {
+  batchStopBtn.disabled = true;
+  batchStatus.textContent = 'Stopping…';
+  await go.StopScan(); // shares the scan cancel; also cancels a running batch
+});
+
 function renderScan(rows, win) {
   scanTbody.innerHTML = '';
   const totalFiles = rows ? rows.length : 0;
@@ -506,24 +582,46 @@ function renderScan(rows, win) {
 
   let frozenCount = 0;
   for (const r of rows) {
+    // Trimmable = frozen intro with a concrete first-change time to cut at.
+    const trimmable = r.frozenIntro && !r.error && r.firstChange && !r.firstChange.startsWith('>');
     const tr = document.createElement('tr');
-    tr.className = 'scan-clickable' + (r.error ? ' scan-err' : (r.frozenIntro ? ' scan-frozen' : ''));
-    tr.title = 'Click to open this file in the trimmer';
+    tr.className = 'scan-row' + (r.error ? ' scan-err' : (r.frozenIntro ? ' scan-frozen' : ''));
 
     const frozenCell = r.error ? '—' : (r.frozenIntro ? 'Yes' : 'No');
     const change     = r.error ? r.error : (r.firstChange || '—');
     const secs       = r.error ? '—' : (r.frozenIntro ? r.freezeSec.toFixed(2) : '0.00');
     if (r.frozenIntro && !r.error) frozenCount++;
 
-    tr.innerHTML =
-      `<td class="scan-file">${escapeHtml(r.file)}</td>` +
-      `<td>${frozenCell}</td><td>${escapeHtml(change)}</td><td>${secs}</td>`;
+    // Checkbox cell (only trimmable rows get one, checked by default).
+    const tdCheck = document.createElement('td');
+    tdCheck.className = 'scan-check';
+    let cb = null;
+    if (trimmable) {
+      cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.className = 'scan-row-check';
+      cb._row = r;
+      cb.addEventListener('click', e => e.stopPropagation());
+      cb.addEventListener('change', updateBatchButton);
+      tdCheck.appendChild(cb);
+    }
+    tr.appendChild(tdCheck);
 
-    // Clicking a row loads it into the trimmer and presets the detected start.
-    tr.addEventListener('click', async () => {
+    const rest = document.createElement('td');
+    rest.className = 'scan-file scan-clickable';
+    rest.textContent = r.file;
+    rest.title = 'Click to open this file in the trimmer';
+    tr.appendChild(rest);
+
+    tr.insertAdjacentHTML('beforeend',
+      `<td>${frozenCell}</td><td>${escapeHtml(change)}</td><td>${secs}</td>`);
+
+    // Clicking the filename loads it into the trimmer and presets the start.
+    rest.addEventListener('click', async () => {
       scanModal.classList.add('hidden');
       await loadVideo(r.path);
-      if (r.frozenIntro && r.firstChange && !r.firstChange.startsWith('>')) {
+      if (trimmable) {
         startTimeIn.value = r.firstChange;
         validateTimeInputs();
         updateDurationLabel();
@@ -532,6 +630,7 @@ function renderScan(rows, win) {
     });
     scanTbody.appendChild(tr);
   }
+  updateBatchButton();
 
   const stoppedNote = stopped ? ` (stopped — ${rows.length}/${totalFiles} scanned)` : '';
   const summary = `${rows.length} file(s) — ${frozenCount} with a frozen intro (first ${win}s)${stoppedNote}`;

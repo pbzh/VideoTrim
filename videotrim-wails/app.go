@@ -35,6 +35,13 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 }
 
+// emit sends a runtime event to the frontend, no-op before startup sets ctx.
+func (a *App) emit(event string, data interface{}) {
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, event, data)
+	}
+}
+
 // --- Data types ---
 
 // VideoInfo holds metadata about a video file.
@@ -462,7 +469,7 @@ func (a *App) ScanFolder(dir string, windowSec float64) []ScanRow {
 			done++
 			d := done
 			doneMu.Unlock()
-			wailsruntime.EventsEmit(a.ctx, "scan:progress", map[string]interface{}{
+			a.emit("scan:progress", map[string]interface{}{
 				"done":        d,
 				"total":       total,
 				"file":        row.File,
@@ -696,25 +703,24 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 
 	if mode == "copy" {
 		// Input seeking: fast, lossless, cuts on nearest keyframe
-		args = []string{
-			"-y",
-			"-ss", params.StartTime,
-			"-to", params.EndTime,
+		args = []string{"-y", "-ss", params.StartTime}
+		if params.EndTime != "" {
+			args = append(args, "-to", params.EndTime)
+		}
+		args = append(args,
 			"-i", params.InputPath,
 			"-c", "copy",
 			"-map", "0",
 			"-avoid_negative_ts", "make_zero",
 			outPath,
-		}
+		)
 	} else {
 		// Output seeking: frame-accurate re-encode
-		args = []string{
-			"-y",
-			"-i", params.InputPath,
-			"-ss", params.StartTime,
-			"-to", params.EndTime,
-			"-c:v", mode,
+		args = []string{"-y", "-i", params.InputPath, "-ss", params.StartTime}
+		if params.EndTime != "" {
+			args = append(args, "-to", params.EndTime)
 		}
+		args = append(args, "-c:v", mode)
 		args = append(args, qualityArgsFor(mode)...)
 		args = append(args,
 			"-c:a", "aac",
@@ -771,4 +777,69 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 		Message:    fmt.Sprintf("Done — %s, %s (%.1f MB): %s", how, verb, sizeMB, finalPath),
 		FileSizeMB: sizeMB,
 	}
+}
+
+// BatchItem is one file to trim in a batch: from StartTime to the end of file.
+type BatchItem struct {
+	Path      string `json:"path"`
+	StartTime string `json:"startTime"` // HH:MM:SS.mmm
+}
+
+// BatchTrimResult summarizes a batch trim run.
+type BatchTrimResult struct {
+	Total     int      `json:"total"`
+	Succeeded int      `json:"succeeded"`
+	Failed    int      `json:"failed"`
+	Errors    []string `json:"errors,omitempty"`
+}
+
+// BatchTrim trims each item from its start time to the end of the file,
+// replacing the source in place. Progress is emitted via "batch:progress".
+// The scan's Stop button (StopScan) also cancels an in-flight batch.
+func (a *App) BatchTrim(items []BatchItem) BatchTrimResult {
+	res := BatchTrimResult{Total: len(items)}
+	if len(items) == 0 {
+		return res
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.scanMu.Lock()
+	if a.scanCancel != nil {
+		a.scanCancel()
+	}
+	a.scanCancel = cancel
+	a.scanMu.Unlock()
+	defer func() {
+		a.scanMu.Lock()
+		a.scanCancel = nil
+		a.scanMu.Unlock()
+		cancel()
+	}()
+
+	for i, it := range items {
+		if ctx.Err() != nil {
+			break // stopped
+		}
+		r := a.TrimVideo(TrimParams{
+			InputPath:     it.Path,
+			StartTime:     it.StartTime,
+			EndTime:       "", // to end of file
+			EncoderMode:   "smart",
+			ReplaceSource: true,
+		})
+		if r.Success {
+			res.Succeeded++
+		} else {
+			res.Failed++
+			res.Errors = append(res.Errors, filepath.Base(it.Path)+": "+r.Message)
+		}
+		a.emit("batch:progress", map[string]interface{}{
+			"done":    i + 1,
+			"total":   len(items),
+			"file":    filepath.Base(it.Path),
+			"success": r.Success,
+			"message": r.Message,
+		})
+	}
+	return res
 }

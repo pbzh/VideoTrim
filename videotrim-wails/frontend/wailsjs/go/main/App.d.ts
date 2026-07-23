@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function AutoOutputPath(arg1:string):Promise<string>;
 
+export function BatchTrim(arg1:Array<main.BatchItem>):Promise<main.BatchTrimResult>;
+
 export function Confirm(arg1:string,arg2:string):Promise<boolean>;
 
 export function DetectFirstChange(arg1:string):Promise<string>;
