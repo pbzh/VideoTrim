@@ -23,14 +23,16 @@ import os
 import re
 import sys
 import json
+import time
+import shlex
 import shutil
 import threading
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject
+from PyQt6.QtGui import QColor, QAction
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -82,12 +84,134 @@ FFMPEG = find_tool("ffmpeg")
 FFPROBE = find_tool("ffprobe")
 
 
-def run(args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
-    """Run a command, capturing text output; never raises on non-zero exit."""
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout,
-        creationflags=_NO_WINDOW if os.name == "nt" else 0,
-    )
+# --------------------------------------------------------------------------
+# ffmpeg log bus — thread-safe; worker threads emit, the log window displays.
+# --------------------------------------------------------------------------
+
+class LogBus(QObject):
+    line = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.enabled = False
+        self._buf: list[str] = []
+        self._lock = threading.Lock()
+
+    def log(self, msg: str):
+        if not self.enabled:
+            return
+        text = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        with self._lock:
+            self._buf.append(text)
+            if len(self._buf) > 5000:
+                del self._buf[:1000]
+        self.line.emit(text)
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self._buf)
+
+
+LOGBUS: "LogBus | None" = None
+
+
+def log(msg: str) -> None:
+    if LOGBUS is not None:
+        LOGBUS.log(msg)
+
+
+def log_cmd(label: str, args: list[str]) -> None:
+    if LOGBUS is None or not LOGBUS.enabled or not args:
+        return
+    cmd = os.path.basename(args[0]) + " " + " ".join(shlex.quote(a) for a in args[1:])
+    log(f"$ [{label}] {cmd}")
+
+
+def log_file(action: str, path: str) -> None:
+    """Log a one-line summary of the file about to be processed."""
+    if LOGBUS is None or not LOGBUS.enabled:
+        return
+    info = _probe(path)
+    base = os.path.basename(path)
+    if info.get("error"):
+        log(f"• {action}: {base} — {info['error']}")
+        return
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        size_mb = 0.0
+    log(f"• {action}: {base} — {info['vcodec'] or '?'} "
+        f"{info['w']}x{info['h']} {info['fps']:.3g}fps "
+        f"{seconds_to_time(info['duration_ms'] / 1000)} {size_mb:.1f}MB")
+
+
+# --------------------------------------------------------------------------
+# Process registry — lets a single Stop cancel every running ffmpeg.
+# --------------------------------------------------------------------------
+
+_PROCS: set[subprocess.Popen] = set()
+_PROCS_LOCK = threading.Lock()
+_WORKERS: set = set()               # QThreads exposing .cancel()
+_WORKERS_LOCK = threading.Lock()
+
+
+def spawn(args: list[str], **kw) -> subprocess.Popen:
+    """Start a tracked subprocess so Stop All can kill it."""
+    p = subprocess.Popen(args, **kw)
+    with _PROCS_LOCK:
+        _PROCS.add(p)
+    return p
+
+
+def _release(p: subprocess.Popen) -> None:
+    with _PROCS_LOCK:
+        _PROCS.discard(p)
+
+
+def register_worker(w) -> None:
+    with _WORKERS_LOCK:
+        _WORKERS.add(w)
+
+
+def unregister_worker(w) -> None:
+    with _WORKERS_LOCK:
+        _WORKERS.discard(w)
+
+
+def stop_all() -> int:
+    """Cancel every tracked worker and kill every running ffmpeg. Returns kills."""
+    with _WORKERS_LOCK:
+        workers = list(_WORKERS)
+    for w in workers:
+        try:
+            w.cancel()
+        except Exception:
+            pass
+    with _PROCS_LOCK:
+        procs = list(_PROCS)
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    if procs:
+        log(f"■ Stop All — killed {len(procs)} ffmpeg process(es)")
+    return len(procs)
+
+
+def run(args: list[str], timeout: float | None = None,
+        label: str = "cmd") -> subprocess.CompletedProcess:
+    """Run a tracked command, capturing text output; never raises on non-zero."""
+    log_cmd(label, args)
+    p = spawn(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+    finally:
+        _release(p)
+    return subprocess.CompletedProcess(args, p.returncode or 0, out, err)
 
 
 # --------------------------------------------------------------------------
@@ -132,9 +256,9 @@ def time_to_seconds(text: str) -> float | None:
 # ffprobe / encoder helpers
 # --------------------------------------------------------------------------
 
-def get_video_info(path: str) -> dict:
+def _probe(path: str) -> dict:
     cp = run([FFPROBE, "-v", "quiet", "-print_format", "json",
-              "-show_streams", "-show_format", path])
+              "-show_streams", "-show_format", path], label="probe")
     if cp.returncode != 0 or not cp.stdout:
         return {"error": "ffprobe failed — is ffmpeg installed?"}
     try:
@@ -145,7 +269,7 @@ def get_video_info(path: str) -> dict:
     fmt = data.get("format") or {}
     info: dict = {
         "format": fmt.get("format_name", ""),
-        "vcodec": "", "acodec": "", "duration_ms": 0, "fps": 0.0,
+        "vcodec": "", "acodec": "", "duration_ms": 0, "fps": 0.0, "w": 0, "h": 0,
     }
     try:
         info["duration_ms"] = int(float(fmt.get("duration", 0)) * 1000)
@@ -156,6 +280,8 @@ def get_video_info(path: str) -> dict:
         kind = st.get("codec_type")
         if kind == "video" and not info["vcodec"]:
             info["vcodec"] = st.get("codec_name", "")
+            info["w"] = st.get("width", 0) or 0
+            info["h"] = st.get("height", 0) or 0
             r = st.get("r_frame_rate", "")
             if "/" in r:
                 num, den = r.split("/", 1)
@@ -173,6 +299,10 @@ def get_video_info(path: str) -> dict:
     return info
 
 
+def get_video_info(path: str) -> dict:
+    return _probe(path)
+
+
 # (label, encoder, hint) — macOS VideoToolbox only.
 _HW_ENCODERS = [
     ("H.264 (VideoToolbox)", "h264_videotoolbox",
@@ -183,7 +313,7 @@ _HW_ENCODERS = [
 
 
 def available_encoders() -> list[dict]:
-    cp = run([FFMPEG, "-hide_banner", "-encoders"])
+    cp = run([FFMPEG, "-hide_banner", "-encoders"], label="encoders")
     out = cp.stdout or ""
     return [{"label": lbl, "encoder": enc, "hint": hint}
             for (lbl, enc, hint) in _HW_ENCODERS if enc in out]
@@ -198,7 +328,7 @@ def quality_args(encoder: str) -> list[str]:
 
 
 def smart_fallback_encoder() -> str:
-    cp = run([FFMPEG, "-hide_banner", "-encoders"])
+    cp = run([FFMPEG, "-hide_banner", "-encoders"], label="encoders")
     if "h264_videotoolbox" in (cp.stdout or ""):
         return "h264_videotoolbox"
     return "libx264"
@@ -212,7 +342,7 @@ def start_on_keyframe(path: str, start_time: str) -> bool:
               "-skip_frame", "nokey",
               "-show_entries", "frame=best_effort_timestamp_time",
               "-read_intervals", f"{start:.3f}%+0.5",
-              "-of", "csv=p=0", path])
+              "-of", "csv=p=0", path], label="keyframe")
     if cp.returncode != 0:
         return False
     for line in cp.stdout.splitlines():
@@ -257,27 +387,30 @@ def detect_first_change(path: str) -> str:
     Streams ffmpeg and stops the moment the first freeze_end is seen, so it
     only decodes up to the first change instead of the whole file.
     """
-    proc = subprocess.Popen(
-        [FFMPEG, "-hide_banner", "-i", path,
-         "-vf", "freezedetect=n=-40dB:d=1", "-map", "0:v:0",
-         "-f", "null", "-"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-    )
+    log_file("detect", path)
+    args = [FFMPEG, "-hide_banner", "-i", path,
+            "-vf", "freezedetect=n=-40dB:d=1", "-map", "0:v:0", "-f", "null", "-"]
+    log_cmd("detect", args)
+    proc = spawn(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     frozen = False
     result = ""
-    assert proc.stderr is not None
-    for line in proc.stderr:
-        if "freeze_start:" in line:
-            m = _FS_RE.search(line)
-            if m and float(m.group(1)) < 0.5:
-                frozen = True
-        elif "freeze_end:" in line and frozen:
-            m = _FE_RE.search(line)
-            if m:
-                result = seconds_to_time(float(m.group(1)))
-                proc.kill()
-                break
-    proc.wait()
+    try:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            if "freeze_start:" in line:
+                m = _FS_RE.search(line)
+                if m and float(m.group(1)) < 0.5:
+                    frozen = True
+            elif "freeze_end:" in line and frozen:
+                m = _FE_RE.search(line)
+                if m:
+                    result = seconds_to_time(float(m.group(1)))
+                    proc.kill()
+                    break
+        proc.wait()
+    finally:
+        _release(proc)
+    log(f"→ detect {os.path.basename(path)}: {result or 'no frozen intro'}")
     return result
 
 
@@ -325,20 +458,27 @@ def trim_video(input_path: str, output_path: str, start: str, end: str,
             return False, 'Output equals input — enable "Overwrite source" to replace it'
         out_path = output_path
 
+    log_file("trim", input_path)
     args, mode = build_trim_args(input_path, out_path, start, end, encoder_mode)
+    log(f"  start={start} end={end or 'EOF'} mode={mode} "
+        f"replace={replace_source}")
+    full = [FFMPEG, "-hide_banner"] + args
+    log_cmd("trim", full)
 
-    proc = subprocess.Popen([FFMPEG, "-hide_banner"] + args,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+    proc = spawn(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if on_proc:
         on_proc(proc)
-    out = proc.stdout.read() if proc.stdout else ""
-    proc.wait()
+    try:
+        out = proc.stdout.read() if proc.stdout else ""
+        proc.wait()
+    finally:
+        _release(proc)
 
     if proc.returncode != 0:
         if replace_source:
             _silent_remove(out_path)
         tail = out[-1500:] if len(out) > 1500 else out
+        log(f"→ trim {os.path.basename(input_path)}: FAILED (exit {proc.returncode})")
         return False, f"ffmpeg error (exit {proc.returncode}):\n{tail}"
 
     if not os.path.exists(out_path):
@@ -356,6 +496,7 @@ def trim_video(input_path: str, output_path: str, start: str, end: str,
 
     how = "lossless copy" if mode == "copy" else f"re-encoded ({mode})"
     verb = "Replaced source" if replace_source else "Saved"
+    log(f"→ trim {os.path.basename(input_path)}: OK ({how}, {size_mb:.1f} MB)")
     return True, f"Done — {how}, {verb} ({size_mb:.1f} MB): {final}"
 
 
@@ -424,18 +565,19 @@ class ScanThread(QThread):
         if self._cancel.is_set():
             row["error"] = "stopped"
             return row
-        proc = subprocess.Popen(
-            [FFMPEG, "-hide_banner", "-i", path,
-             "-t", f"{self.window:.3f}", "-vf", "freezedetect=n=-40dB:d=1",
-             "-map", "0:v:0", "-an", "-f", "null", "-"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
+        log_file("scan", path)
+        args = [FFMPEG, "-hide_banner", "-i", path,
+                "-t", f"{self.window:.3f}", "-vf", "freezedetect=n=-40dB:d=1",
+                "-map", "0:v:0", "-an", "-f", "null", "-"]
+        log_cmd("scan", args)
+        proc = spawn(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         with self._lock:
             self._procs.add(proc)
         err = proc.stderr.read() if proc.stderr else ""
         proc.wait()
         with self._lock:
             self._procs.discard(proc)
+        _release(proc)
 
         if self._cancel.is_set():
             row["error"] = "stopped"
@@ -453,9 +595,18 @@ class ScanThread(QThread):
             else:
                 row["freeze_sec"] = self.window
                 row["first_change"] = ">" + seconds_to_time(self.window)
+        log(f"→ scan {row['file']}: "
+            + (row["error"] or (f"frozen {row['first_change']}" if row["frozen"] else "no freeze")))
         return row
 
     def run(self):
+        register_worker(self)
+        try:
+            self._run()
+        finally:
+            unregister_worker(self)
+
+    def _run(self):
         files = sorted(
             str(Path(self.folder) / e)
             for e in os.listdir(self.folder)
@@ -513,24 +664,28 @@ class BatchThread(QThread):
             self._proc = proc
 
     def run(self):
+        register_worker(self)
         total = len(self.items)
         succeeded = failed = 0
         errors: list[str] = []
-        for i, it in enumerate(self.items):
-            if self._cancel.is_set():
-                break
-            ok, msg = trim_video(
-                input_path=it["path"], output_path="", start=it["start"],
-                end="", encoder_mode="smart", replace_source=True,
-                on_proc=self._register,
-            )
-            if ok:
-                succeeded += 1
-            else:
-                failed += 1
-                errors.append(f"{os.path.basename(it['path'])}: {msg}")
-            self.progress.emit({"done": i + 1, "total": total,
-                                "file": os.path.basename(it["path"]), "success": ok})
+        try:
+            for i, it in enumerate(self.items):
+                if self._cancel.is_set():
+                    break
+                ok, msg = trim_video(
+                    input_path=it["path"], output_path="", start=it["start"],
+                    end="", encoder_mode="smart", replace_source=True,
+                    on_proc=self._register,
+                )
+                if ok:
+                    succeeded += 1
+                else:
+                    failed += 1
+                    errors.append(f"{os.path.basename(it['path'])}: {msg}")
+                self.progress.emit({"done": i + 1, "total": total,
+                                    "file": os.path.basename(it["path"]), "success": ok})
+        finally:
+            unregister_worker(self)
         self.done.emit({"total": total, "succeeded": succeeded,
                         "failed": failed, "errors": errors})
 
@@ -710,6 +865,51 @@ class ScanDialog(QDialog):
 
 
 # --------------------------------------------------------------------------
+# ffmpeg log window
+# --------------------------------------------------------------------------
+
+class LogWindow(QDialog):
+    closed = pyqtSignal()
+
+    def __init__(self, bus: LogBus, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ffmpeg Log")
+        self.resize(780, 400)
+        self.bus = bus
+
+        v = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        lbl = QLabel("Every ffmpeg / ffprobe command and the file being processed.")
+        lbl.setStyleSheet("color:#888;")
+        bar.addWidget(lbl)
+        bar.addStretch(1)
+        clear = QPushButton("Clear"); clear.clicked.connect(lambda: self.text.clear())
+        save = QPushButton("Save…"); save.clicked.connect(self._save)
+        bar.addWidget(clear); bar.addWidget(save)
+        v.addLayout(bar)
+
+        self.text = QPlainTextEdit(); self.text.setReadOnly(True)
+        self.text.setObjectName("log"); self.text.setMaximumBlockCount(5000)
+        v.addWidget(self.text, 1)
+
+        self.text.setPlainText("\n".join(bus.snapshot()))
+        bus.line.connect(self.text.appendPlainText)
+
+    def _save(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save log", "ffmpeg-log.txt",
+                                              "Text (*.txt);;All Files (*)")
+        if path:
+            try:
+                Path(path).write_text(self.text.toPlainText())
+            except OSError as e:
+                QMessageBox.warning(self, "Save failed", str(e))
+
+    def closeEvent(self, e):
+        self.closed.emit()
+        super().closeEvent(e)
+
+
+# --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
 
@@ -727,11 +927,36 @@ class VideoTrim(QMainWindow):
         self.detect_thread: DetectThread | None = None
         self.trim_thread: TrimThread | None = None
         self.scan_thread: ScanThread | None = None
+        self.log_window: LogWindow | None = None
 
         self._build_ui()
+        self._build_menu()
         self._setup_player()
         self._load_encoders()
         self._set_controls_enabled(False)
+
+    def _build_menu(self):
+        view = self.menuBar().addMenu("View")
+        self.log_action = QAction("Show ffmpeg Log", self, checkable=True)
+        self.log_action.setShortcut("Ctrl+L")
+        self.log_action.toggled.connect(self._toggle_log_window)
+        view.addAction(self.log_action)
+
+    def _toggle_log_window(self, on: bool):
+        if LOGBUS is None:
+            return
+        if on:
+            if self.log_window is None:
+                self.log_window = LogWindow(LOGBUS, self)
+                self.log_window.closed.connect(lambda: self.log_action.setChecked(False))
+            LOGBUS.enabled = True
+            log("ffmpeg logging enabled")
+            self.log_window.show()
+            self.log_window.raise_()
+        else:
+            LOGBUS.enabled = False
+            if self.log_window:
+                self.log_window.hide()
 
     # ---- UI construction -------------------------------------------------
 
@@ -843,10 +1068,16 @@ class VideoTrim(QMainWindow):
         olay.addWidget(self.overwrite)
         root.addWidget(obox)
 
-        # Trim button
+        # Trim + global stop
+        trow = QHBoxLayout()
         self.trim_btn = QPushButton("Trim Video"); self.trim_btn.setObjectName("primary")
         self.trim_btn.clicked.connect(self._trim)
-        root.addWidget(self.trim_btn)
+        self.stop_all_btn = QPushButton("Stop All ffmpeg"); self.stop_all_btn.setObjectName("danger")
+        self.stop_all_btn.setToolTip("Cancel every running ffmpeg process (trim, detect, scan, batch)")
+        self.stop_all_btn.clicked.connect(self._stop_all)
+        trow.addWidget(self.trim_btn, 1)
+        trow.addWidget(self.stop_all_btn)
+        root.addLayout(trow)
 
         # Folder freeze scan
         sbox, slay = self._group("Folder Freeze Scan")
@@ -1098,6 +1329,20 @@ class VideoTrim(QMainWindow):
             self.player.setSource(QUrl())
             self.player.setSource(QUrl.fromLocalFile(self.current_path))
 
+    # ---- Global stop -----------------------------------------------------
+
+    def _stop_all(self):
+        n = stop_all()
+        if self.scan_thread:
+            self.scan_thread.cancel()
+        # Re-enable anything that may be left disabled by an aborted op.
+        self.trim_btn.setEnabled(True)
+        self.scan_btn.setEnabled(True)
+        self.scan_stop.setEnabled(False)
+        self.detect_btn.setEnabled(True)
+        self.detect_btn.setText("Detect Start")
+        self._show_status(f"Stopped — killed {n} ffmpeg process(es).", "error")
+
     # ---- Folder scan -----------------------------------------------------
 
     def _toggle_log(self, on: bool):
@@ -1185,6 +1430,12 @@ QPushButton:disabled { color: #666; background: #303032; }
 QPushButton#primary { background: #0e7ad1; border-color: #0e7ad1; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #1589e4; }
 QPushButton#primary:disabled { background: #2a4a63; color: #99b; }
+QPushButton#danger { background: #7a2323; border-color: #a13030; color: #ffd7d7; font-weight: 600; }
+QPushButton#danger:hover { background: #a13030; }
+QMenuBar { background: #1e1e1e; color: #ccc; }
+QMenuBar::item:selected { background: #3a3a3c; }
+QMenu { background: #252526; color: #ccc; border: 1px solid #3f3f46; }
+QMenu::item:selected { background: #0e7ad1; }
 QTableWidget { background: #252526; gridline-color: #3f3f46; }
 QHeaderView::section { background: #2d2d30; color: #888; border: none; padding: 5px 8px; }
 QSlider::groove:horizontal { height: 4px; background: #3f3f46; border-radius: 2px; }
@@ -1193,9 +1444,9 @@ QSlider::handle:horizontal { width: 12px; background: #0e7ad1; border-radius: 6p
 
 
 def main():
-    if FFMPEG == "ffmpeg" and not shutil.which("ffmpeg"):
-        pass  # resolved lazily; error surfaces on first use
+    global LOGBUS
     app = QApplication(sys.argv)
+    LOGBUS = LogBus()          # created after QApplication for cross-thread signals
     app.setStyleSheet(STYLE)
     win = VideoTrim()
     win.show()
