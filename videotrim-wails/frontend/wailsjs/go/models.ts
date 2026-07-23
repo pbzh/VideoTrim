@@ -22,6 +22,7 @@ export namespace main {
 	    startTime: string;
 	    endTime: string;
 	    encoderMode: string;
+	    replaceSource: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new TrimParams(source);
@@ -34,6 +35,7 @@ export namespace main {
 	        this.startTime = source["startTime"];
 	        this.endTime = source["endTime"];
 	        this.encoderMode = source["encoderMode"];
+	        this.replaceSource = source["replaceSource"];
 	    }
 	}
 	export class TrimResult {

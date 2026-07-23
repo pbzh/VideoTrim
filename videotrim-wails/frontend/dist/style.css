@@ -64,6 +64,15 @@ body {
 
 label { color: var(--dim); white-space: nowrap; }
 
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  white-space: normal;
+}
+.check-label input { width: auto; cursor: pointer; }
+
 /* Inputs */
 .path-input {
   flex: 1;

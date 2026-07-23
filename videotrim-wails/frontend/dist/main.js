@@ -27,7 +27,10 @@ const startTimeIn   = el('start-time');
 const endTimeIn     = el('end-time');
 const setStartBtn   = el('set-start-btn');
 const setEndBtn     = el('set-end-btn');
+const detectStartBtn = el('detect-start-btn');
 const durationLabel = el('duration-label');
+const outputBrowseBtn = el('output-browse-btn');
+const overwriteChk  = el('overwrite-source');
 const encodingCombo = el('encoding-combo');
 const encodingHint  = el('encoding-hint');
 const outputPath    = el('output-path');
@@ -70,6 +73,7 @@ function setControlsEnabled(on) {
   stepFwd1s.disabled     = !on;
   setStartBtn.disabled   = !on;
   setEndBtn.disabled     = !on;
+  detectStartBtn.disabled = !on;
   trimBtn.disabled       = !on;
   scrubSlider.disabled   = !on;
 }
@@ -150,8 +154,9 @@ async function loadVideo(path) {
   }
   lastInfoDurationMs = info.durationMs || 0;
 
-  // Point <video> at the Go file-server endpoint
-  video.src = `/video?path=${encodeURIComponent(path)}`;
+  // Point <video> at the Go file-server endpoint (cache-bust so a replaced
+  // source reloads its new content instead of the stale cached video)
+  video.src = `/video?path=${encodeURIComponent(path)}&_=${Date.now()}`;
   video.classList.add('loaded');
   placeholder.style.display = 'none';
 
@@ -250,6 +255,49 @@ setEndBtn.addEventListener('click', () => {
   updateDurationLabel();
 });
 
+// --- Detect first frame change (skip frozen intro) ---
+
+detectStartBtn.addEventListener('click', async () => {
+  const input = filePath.value;
+  if (!input) return;
+
+  detectStartBtn.disabled = true;
+  const prevText = detectStartBtn.textContent;
+  detectStartBtn.textContent = 'Detecting…';
+  showStatus('Detecting first frame change…', '');
+
+  try {
+    const t = await go.DetectFirstChange(input);
+    if (t) {
+      startTimeIn.value = t;
+      validateTimeInputs();
+      updateDurationLabel();
+      const ms = timeToMs(t);
+      if (ms >= 0) {
+        video.currentTime = ms / 1000;
+        scrubSlider.value = ms;
+        posLabel.textContent = t;
+      }
+      showStatus('First frame change at ' + t + ' — start set', 'success');
+    } else {
+      showStatus('No frozen intro detected — start left unchanged.', '');
+    }
+  } catch (e) {
+    showStatus('Detect failed: ' + String(e), 'error');
+  } finally {
+    detectStartBtn.textContent = prevText;
+    detectStartBtn.disabled = false;
+  }
+});
+
+// --- Overwrite-source toggle ---
+
+overwriteChk.addEventListener('change', () => {
+  const on = overwriteChk.checked;
+  outputPath.disabled = on;
+  outputBrowseBtn.disabled = on;
+});
+
 // --- Time input validation & duration ---
 
 function validateTimeInputs() {
@@ -288,14 +336,15 @@ el('output-browse-btn').addEventListener('click', async () => {
 // --- Trim ---
 
 trimBtn.addEventListener('click', async () => {
-  const input  = filePath.value;
-  const output = outputPath.value.trim();
+  const input   = filePath.value;
+  const output  = outputPath.value.trim();
+  const replace = overwriteChk.checked;
 
   if (!input) {
     showStatus('Please select a valid input file.', 'error');
     return;
   }
-  if (!output) {
+  if (!replace && !output) {
     showStatus('Please specify an output file path.', 'error');
     return;
   }
@@ -312,20 +361,26 @@ trimBtn.addEventListener('click', async () => {
     return;
   }
 
-  const exists = await go.FileExists(output);
-  if (exists) {
-    const name = output.split(/[/\\]/).pop();
-    if (!confirm(`"${name}" already exists. Overwrite?`)) return;
+  if (replace) {
+    const name = input.split(/[/\\]/).pop();
+    if (!confirm(`Overwrite the source file "${name}" with the trimmed result?\nThis cannot be undone.`)) return;
+  } else {
+    const exists = await go.FileExists(output);
+    if (exists) {
+      const name = output.split(/[/\\]/).pop();
+      if (!confirm(`"${name}" already exists. Overwrite?`)) return;
+    }
   }
 
   video.pause();
 
   const params = {
-    inputPath:   input,
-    outputPath:  output,
-    startTime:   msToTime(startMs),  // normalised HH:MM:SS.mmm
-    endTime:     msToTime(endMs),
-    encoderMode: encodingCombo.value,
+    inputPath:     input,
+    outputPath:    replace ? '' : output,
+    startTime:     msToTime(startMs),  // normalised HH:MM:SS.mmm
+    endTime:       msToTime(endMs),
+    encoderMode:   encodingCombo.value,
+    replaceSource: replace,
   };
 
   trimBtn.disabled = true;
@@ -335,6 +390,10 @@ trimBtn.addEventListener('click', async () => {
   try {
     const result = await go.TrimVideo(params);
     showStatus(result.message, result.success ? 'success' : 'error');
+    // Source was replaced — reload the preview to show the trimmed video.
+    if (result.success && replace) {
+      await loadVideo(input);
+    }
   } catch (e) {
     showStatus('Unexpected error: ' + String(e), 'error');
   } finally {

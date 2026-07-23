@@ -6,6 +6,10 @@ export function AutoOutputPath(arg1) {
   return window['go']['main']['App']['AutoOutputPath'](arg1);
 }
 
+export function DetectFirstChange(arg1) {
+  return window['go']['main']['App']['DetectFirstChange'](arg1);
+}
+
 export function FileExists(arg1) {
   return window['go']['main']['App']['FileExists'](arg1);
 }

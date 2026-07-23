@@ -45,6 +45,7 @@
         <label>Start:</label>
         <input type="text" id="start-time" class="time-input" value="00:00:00.000" />
         <button id="set-start-btn" class="btn" disabled>Set Start</button>
+        <button id="detect-start-btn" class="btn" disabled title="Auto-detect the first frame change (skips a frozen intro)">Detect Start</button>
         <div class="trim-spacer"></div>
         <label>End:</label>
         <input type="text" id="end-time" class="time-input" value="00:00:00.000" />
@@ -70,6 +71,12 @@
       <div class="row">
         <input type="text" id="output-path" class="path-input" placeholder="Auto-generated from input filename" />
         <button id="output-browse-btn" class="btn">Browse…</button>
+      </div>
+      <div class="row">
+        <label class="check-label">
+          <input type="checkbox" id="overwrite-source" />
+          Overwrite source (replace the opened file with the trimmed result)
+        </label>
       </div>
     </div>
 

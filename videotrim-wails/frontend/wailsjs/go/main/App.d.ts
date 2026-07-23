@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function AutoOutputPath(arg1:string):Promise<string>;
 
+export function DetectFirstChange(arg1:string):Promise<string>;
+
 export function FileExists(arg1:string):Promise<boolean>;
 
 export function GetAvailableEncoders():Promise<Array<main.EncoderInfo>>;

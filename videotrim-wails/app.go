@@ -52,11 +52,12 @@ type EncoderInfo struct {
 
 // TrimParams holds all parameters needed to run a trim operation.
 type TrimParams struct {
-	InputPath   string `json:"inputPath"`
-	OutputPath  string `json:"outputPath"`
-	StartTime   string `json:"startTime"` // HH:MM:SS.mmm
-	EndTime     string `json:"endTime"`   // HH:MM:SS.mmm
-	EncoderMode string `json:"encoderMode"` // "copy" or ffmpeg encoder name
+	InputPath     string `json:"inputPath"`
+	OutputPath    string `json:"outputPath"`
+	StartTime     string `json:"startTime"` // HH:MM:SS.mmm
+	EndTime       string `json:"endTime"`   // HH:MM:SS.mmm
+	EncoderMode   string `json:"encoderMode"`   // "smart", "copy", or ffmpeg encoder name
+	ReplaceSource bool   `json:"replaceSource"` // overwrite the input file with the result
 }
 
 // TrimResult is returned after a trim operation.
@@ -206,6 +207,89 @@ func smartFallbackEncoder() string {
 	return "libx264"
 }
 
+// parseInitialFreezeEnd scans ffmpeg freezedetect output and returns the
+// timestamp (seconds) where an initial freeze ends — the moment of the first
+// real frame change. Returns -1 when the video does not start frozen.
+//
+// freezedetect emits lines like:
+//
+//	[freezedetect @ 0x...] freeze_start: 0.000000
+//	[freezedetect @ 0x...] freeze_end: 2.167
+func parseInitialFreezeEnd(text string) float64 {
+	foundZeroStart := false
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case strings.Contains(line, "freeze_start:"):
+			if v, ok := lastFloatAfter(line, "freeze_start:"); ok && v < 0.5 {
+				foundZeroStart = true
+			}
+		case strings.Contains(line, "freeze_end:") && foundZeroStart:
+			if v, ok := lastFloatAfter(line, "freeze_end:"); ok {
+				return v
+			}
+		}
+	}
+	return -1
+}
+
+// lastFloatAfter parses the float immediately following the given marker.
+func lastFloatAfter(line, marker string) (float64, bool) {
+	idx := strings.Index(line, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(line[idx+len(marker):])
+	end := 0
+	for end < len(rest) && (rest[end] == '.' || rest[end] == '-' || (rest[end] >= '0' && rest[end] <= '9')) {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(rest[:end], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// DetectFirstChange finds the timestamp of the first real frame change (end of
+// an initial frozen/static intro) and returns it as HH:MM:SS.mmm. Returns an
+// empty string when the video does not start with a freeze.
+func (a *App) DetectFirstChange(path string) string {
+	if path == "" {
+		return ""
+	}
+	// freezedetect logs to stderr; -f null discards the decoded output.
+	cmd := exec.Command(ffmpegBin(),
+		"-hide_banner",
+		"-i", path,
+		"-vf", "freezedetect=n=-40dB:d=0",
+		"-map", "0:v:0",
+		"-f", "null", "-",
+	)
+	out, _ := cmd.CombinedOutput() // non-zero exit is fine; we parse the log
+	secs := parseInitialFreezeEnd(string(out))
+	if secs <= 0 {
+		return ""
+	}
+	return secondsToTime(secs)
+}
+
+// secondsToTime formats seconds as HH:MM:SS.mmm.
+func secondsToTime(secs float64) string {
+	if secs < 0 {
+		secs = 0
+	}
+	totalMs := int64(secs*1000 + 0.5)
+	ms := totalMs % 1000
+	totalSec := totalMs / 1000
+	s := totalSec % 60
+	m := (totalSec / 60) % 60
+	h := totalSec / 3600
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
+}
+
 // --- Bound methods ---
 
 // GetAvailableEncoders probes ffmpeg for available hardware encoders.
@@ -348,14 +432,24 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 	if _, err := os.Stat(params.InputPath); err != nil {
 		return TrimResult{Success: false, Message: "Input file not found"}
 	}
-	if params.OutputPath == "" {
-		return TrimResult{Success: false, Message: "No output path specified"}
-	}
 
-	absIn, _ := filepath.Abs(params.InputPath)
-	absOut, _ := filepath.Abs(params.OutputPath)
-	if absIn == absOut {
-		return TrimResult{Success: false, Message: "Output file cannot be the same as input"}
+	// outPath is where ffmpeg actually writes. When replacing the source we
+	// write to a sibling temp file first, then atomically rename it over the
+	// input once ffmpeg succeeds.
+	outPath := params.OutputPath
+	if params.ReplaceSource {
+		ext := filepath.Ext(params.InputPath)
+		base := strings.TrimSuffix(params.InputPath, ext)
+		outPath = base + ".vt_tmp" + ext
+	} else {
+		if params.OutputPath == "" {
+			return TrimResult{Success: false, Message: "No output path specified"}
+		}
+		absIn, _ := filepath.Abs(params.InputPath)
+		absOut, _ := filepath.Abs(params.OutputPath)
+		if absIn == absOut {
+			return TrimResult{Success: false, Message: "Output file cannot be the same as input — enable \"Overwrite source\" to replace it"}
+		}
 	}
 
 	var args []string
@@ -380,7 +474,7 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 			"-c", "copy",
 			"-map", "0",
 			"-avoid_negative_ts", "make_zero",
-			params.OutputPath,
+			outPath,
 		}
 	} else {
 		// Output seeking: frame-accurate re-encode
@@ -397,7 +491,7 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 			"-b:a", "192k",
 			"-map", "0",
 			"-avoid_negative_ts", "make_zero",
-			params.OutputPath,
+			outPath,
 		)
 	}
 
@@ -405,6 +499,9 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 	out, err := cmd.CombinedOutput()
 
 	if err != nil {
+		if params.ReplaceSource {
+			os.Remove(outPath) // clean up partial temp file
+		}
 		output := string(out)
 		if len(output) > 2000 {
 			output = "…" + output[len(output)-2000:]
@@ -415,19 +512,33 @@ func (a *App) TrimVideo(params TrimParams) TrimResult {
 		}
 	}
 
-	stat, statErr := os.Stat(params.OutputPath)
+	stat, statErr := os.Stat(outPath)
 	if statErr != nil {
 		return TrimResult{Success: false, Message: "ffmpeg reported success but output file was not created"}
+	}
+	sizeMB := float64(stat.Size()) / (1024 * 1024)
+
+	finalPath := outPath
+	if params.ReplaceSource {
+		// Atomically replace the source with the trimmed temp file.
+		if err := os.Rename(outPath, params.InputPath); err != nil {
+			os.Remove(outPath)
+			return TrimResult{Success: false, Message: "Trim succeeded but could not replace source file: " + err.Error()}
+		}
+		finalPath = params.InputPath
 	}
 
 	how := "re-encoded (" + mode + ")"
 	if mode == "copy" {
 		how = "lossless copy"
 	}
-	sizeMB := float64(stat.Size()) / (1024 * 1024)
+	verb := "Saved"
+	if params.ReplaceSource {
+		verb = "Replaced source"
+	}
 	return TrimResult{
 		Success:    true,
-		Message:    fmt.Sprintf("Done — %s (%.1f MB): %s", how, sizeMB, params.OutputPath),
+		Message:    fmt.Sprintf("Done — %s, %s (%.1f MB): %s", how, verb, sizeMB, finalPath),
 		FileSizeMB: sizeMB,
 	}
 }
