@@ -10,6 +10,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+ROOT="$(pwd)"
 
 FFMPEG="$(command -v ffmpeg)"
 FFPROBE="$(command -v ffprobe)"
@@ -25,8 +26,10 @@ python3 -m PyInstaller --noconfirm --windowed --onedir --name VideoTrim \
   --distpath build/macos-python/dist \
   --workpath build/macos-python/work \
   --specpath build/macos-python \
+  --icon "$ROOT/assets/icon.icns" \
   --add-binary "${FFMPEG}:." \
   --add-binary "${FFPROBE}:." \
+  --add-data "$ROOT/assets/icon.png:." \
   --osx-bundle-identifier com.pblab.videotrim \
   videotrim.py
 

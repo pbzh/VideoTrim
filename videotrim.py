@@ -37,7 +37,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QAction
+from PyQt6.QtGui import QColor, QAction, QIcon
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -79,6 +79,21 @@ def _app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def icon_path() -> str:
+    """Path to the bundled app icon, or "" when running from a bare checkout."""
+    bases = [_app_dir(), Path(getattr(sys, "_MEIPASS", _app_dir()))]
+    if not getattr(sys, "frozen", False):
+        bases.append(Path(__file__).resolve().parent / "assets")
+    else:
+        bases.append(_app_dir() / "_internal")     # PyInstaller 6.x onedir
+    for base in bases:
+        for name in ("icon.png", "icon.ico"):
+            cand = base / name
+            if cand.is_file():
+                return str(cand)
+    return ""
 
 
 def find_tool(base_name: str) -> str:
@@ -1485,6 +1500,9 @@ def main():
     app = QApplication(sys.argv)
     LOGBUS = LogBus()          # created after QApplication for cross-thread signals
     app.setStyleSheet(STYLE)
+    ico = icon_path()
+    if ico:
+        app.setWindowIcon(QIcon(ico))
     win = VideoTrim()
     win.show()
     sys.exit(app.exec())
