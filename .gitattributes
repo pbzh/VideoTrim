@@ -9,6 +9,7 @@
 *.dll  binary
 *.png  binary
 *.ico  binary
+*.icns binary
 *.jpg  binary
 *.jpeg binary
 *.gif  binary

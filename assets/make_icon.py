@@ -1,79 +1,80 @@
-"""Generate the VideoTrim app icon (icon.ico + icon.png).
+"""Generate the VideoTrim app icon (icon.png + icon.ico + icon.icns) from icon.svg.
 
 Run: python assets/make_icon.py
-Design: rounded dark-slate tile, accent play triangle flanked by two trim
-bars — reads as "trim a video" even at 16x16.
+
+Source of truth is icon.svg (dark-slate rounded tile, gradient timeline frame
+with trim cut-lines, play triangle, corner crop brackets, "00:15" timecode).
+The SVG is rasterized to a 1024px PNG, then downscaled into the platform icons.
+
+Rasterizer: tries rsvg-convert, then Inkscape, then cairosvg, then macOS
+qlmanage (Quick Look) — first one found wins.
 """
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 HERE = Path(__file__).resolve().parent
-SS = 8  # supersample factor for smooth edges
-BASE = 256
-S = BASE * SS
-
-BG_TOP = (38, 50, 64)      # slate
-BG_BOT = (24, 32, 42)
-ACCENT = (78, 201, 148)    # green (matches COLOR_SUCCESS in app)
-BAR = (236, 240, 244)      # near-white trim bars
+SVG = HERE / "icon.svg"
+RASTER = 1024
 
 
-def rounded_mask(size: int, radius: int) -> Image.Image:
-    m = Image.new("L", (size, size), 0)
-    d = ImageDraw.Draw(m)
-    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
-    return m
-
-
-def vertical_gradient(size: int, top, bot) -> Image.Image:
-    grad = Image.new("RGB", (1, size))
-    for y in range(size):
-        t = y / (size - 1)
-        grad.putpixel((0, y), tuple(int(a + (b - a) * t) for a, b in zip(top, bot)))
-    return grad.resize((size, size))
-
-
-def build() -> Image.Image:
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-
-    bg = vertical_gradient(S, BG_TOP, BG_BOT).convert("RGBA")
-    img.paste(bg, (0, 0), rounded_mask(S, int(S * 0.22)))
-
-    d = ImageDraw.Draw(img)
-
-    # Two trim bars
-    bar_w = int(S * 0.085)
-    bar_top = int(S * 0.28)
-    bar_bot = int(S * 0.72)
-    left_x = int(S * 0.24)
-    right_x = int(S * 0.76) - bar_w
-    r = bar_w // 2
-    d.rounded_rectangle([left_x, bar_top, left_x + bar_w, bar_bot], radius=r, fill=BAR)
-    d.rounded_rectangle([right_x, bar_top, right_x + bar_w, bar_bot], radius=r, fill=BAR)
-
-    # Center play triangle
-    cx, cy = S // 2, S // 2
-    tw = int(S * 0.17)
-    th = int(S * 0.22)
-    d.polygon(
-        [(cx - tw // 2, cy - th // 2), (cx - tw // 2, cy + th // 2), (cx + tw, cy)],
-        fill=ACCENT,
+def rasterize_svg(svg: Path, out_png: Path, size: int) -> None:
+    """Render *svg* to a *size*x*size* PNG at *out_png* using whatever
+    SVG rasterizer is on the system."""
+    if shutil.which("rsvg-convert"):
+        subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size), "-o", str(out_png), str(svg)],
+            check=True,
+        )
+        return
+    if shutil.which("inkscape"):
+        subprocess.run(
+            ["inkscape", str(svg), "--export-type=png", f"--export-filename={out_png}",
+             "-w", str(size), "-h", str(size)],
+            check=True,
+        )
+        return
+    try:
+        import cairosvg  # type: ignore
+        cairosvg.svg2png(url=str(svg), write_to=str(out_png),
+                         output_width=size, output_height=size)
+        return
+    except ImportError:
+        pass
+    if shutil.which("qlmanage"):  # macOS Quick Look fallback
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(
+                ["qlmanage", "-t", "-s", str(size), "-o", tmp, str(svg)],
+                check=True, capture_output=True,
+            )
+            thumb = next(Path(tmp).glob("*.png"))
+            Image.open(thumb).save(out_png)
+        return
+    raise RuntimeError(
+        "No SVG rasterizer found. Install one of: rsvg-convert, inkscape, "
+        "cairosvg (pip install cairosvg), or run on macOS (qlmanage)."
     )
-
-    return img.resize((BASE, BASE), Image.LANCZOS)
 
 
 def main() -> None:
-    icon = build()
-    icon.save(HERE / "icon.png")
+    with tempfile.TemporaryDirectory() as tmp:
+        raster = Path(tmp) / "icon.png"
+        rasterize_svg(SVG, raster, RASTER)
+        src = Image.open(raster).convert("RGBA")
+
+    base = src.resize((256, 256), Image.LANCZOS)
+    base.save(HERE / "icon.png")
+
     sizes = [16, 24, 32, 48, 64, 128, 256]
-    icon.save(HERE / "icon.ico", sizes=[(s, s) for s in sizes])
+    base.save(HERE / "icon.ico", sizes=[(s, s) for s in sizes])
     wrote = ["icon.png", "icon.ico"]
 
-    # macOS .icns — best effort; PIL needs a 1024px source.
+    # macOS .icns — PIL needs a 1024px source.
     try:
-        icon.resize((1024, 1024), Image.LANCZOS).save(HERE / "icon.icns")
+        src.resize((1024, 1024), Image.LANCZOS).save(HERE / "icon.icns")
         wrote.append("icon.icns")
     except Exception as e:  # pragma: no cover - platform/format dependent
         print(f"Skipped icon.icns: {e}")

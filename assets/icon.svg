@@ -1,0 +1,47 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="frameGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- Timeline bar, same footprint as the photo frame in the sibling icon -->
+  <rect x="252" y="372" width="520" height="280" rx="16"
+        fill="none" stroke="url(#frameGrad)" stroke-width="22"/>
+
+  <!-- Trimmed-out regions, dimmed -->
+  <rect x="263" y="383" width="87" height="258" fill="url(#frameGrad)" opacity="0.14"/>
+  <rect x="674" y="383" width="87" height="258" fill="url(#frameGrad)" opacity="0.14"/>
+
+  <!-- Cut lines marking the trim points -->
+  <line x1="350" y1="372" x2="350" y2="652" stroke="url(#frameGrad)" stroke-width="22"/>
+  <line x1="674" y1="372" x2="674" y2="652" stroke="url(#frameGrad)" stroke-width="22"/>
+
+  <!-- Play triangle in the kept segment -->
+  <path d="M 478 452 L 478 572 L 578 512 Z" fill="url(#frameGrad)" opacity="0.55"/>
+
+  <!-- Corner crop brackets (top-left) -->
+  <path d="M 150 260 L 150 200 L 210 200" fill="none"
+        stroke="#f8fafc" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- top-right -->
+  <path d="M 814 200 L 874 200 L 874 260" fill="none"
+        stroke="#f8fafc" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- bottom-left -->
+  <path d="M 150 764 L 150 824 L 210 824" fill="none"
+        stroke="#f8fafc" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- bottom-right -->
+  <path d="M 814 824 L 874 824 L 874 764" fill="none"
+        stroke="#f8fafc" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Timecode label, same position/style as the ratio label -->
+  <text x="512" y="760" text-anchor="middle" font-family="Helvetica, Arial, sans-serif"
+        font-weight="700" font-size="72" fill="#f8fafc" letter-spacing="2">00:15</text>
+</svg>
