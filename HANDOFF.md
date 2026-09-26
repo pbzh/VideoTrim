@@ -40,7 +40,7 @@ Single-file PyQt6 app. Key pieces:
     broken ones are hidden. Intel QSV support was removed.
   - `smart_fallback_encoder`: first working of videotoolbox/amf, else x264.
 - **Smart mode** (`build_trim_args`): lossless stream-copy when the start lands
-  on a keyframe (`start_on_keyframe` via ffprobe), else a frame-accurate
+  on a keyframe (`keyframe_at` via ffprobe), else a frame-accurate
   near-lossless HW re-encode. `EndTime` optional ("" = trim to EOF).
 - **Trim** (`trim_video`): builds args, replace-source writes a `.vt_tmp` sibling
   then `os.replace()` (atomic) over the source. Returns `(ok, message)`.

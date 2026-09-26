@@ -271,7 +271,7 @@ def ms_to_time(ms: int) -> str:
 
 def time_to_ms(text: str) -> int:
     m = _TIME_RE.match(text.strip())
-    if not m:
+    if not m or int(m.group(2)) >= 60 or int(m.group(3)) >= 60:
         return -1
     msec = int((m.group(4) or "0").ljust(3, "0")) if m.group(4) else 0
     return int(m.group(1)) * 3_600_000 + int(m.group(2)) * 60_000 + int(m.group(3)) * 1000 + msec
@@ -310,9 +310,15 @@ def _probe(path: str) -> dict:
     info: dict = {
         "format": fmt.get("format_name", ""),
         "vcodec": "", "acodec": "", "duration_ms": 0, "fps": 0.0, "w": 0, "h": 0,
+        "start": 0.0, "pix_fmt": "", "colors": {},
     }
     try:
         info["duration_ms"] = int(float(fmt.get("duration", 0)) * 1000)
+    except (TypeError, ValueError):
+        pass
+    try:
+        # ffmpeg's -ss/-to are relative to this; ffprobe timestamps are not.
+        info["start"] = float(fmt.get("start_time", 0))
     except (TypeError, ValueError):
         pass
 
@@ -322,6 +328,13 @@ def _probe(path: str) -> dict:
             info["vcodec"] = st.get("codec_name", "")
             info["w"] = st.get("width", 0) or 0
             info["h"] = st.get("height", 0) or 0
+            info["pix_fmt"] = st.get("pix_fmt", "") or ""
+            info["colors"] = {
+                flag: st[key] for key, flag in (("color_primaries", "-color_primaries"),
+                                                ("color_transfer", "-color_trc"),
+                                                ("color_space", "-colorspace"))
+                if st.get(key) and st[key] not in ("unknown", "reserved")
+            }
             r = st.get("r_frame_rate", "")
             if "/" in r:
                 num, den = r.split("/", 1)
@@ -362,13 +375,55 @@ _WORKING: list[str] | None = None     # HW encoders that passed a test encode
 _WORKING_LOCK = threading.Lock()
 
 
-def _encoder_works(encoder: str) -> bool:
-    """Encode a few black frames with the real quality flags; True on success."""
+def _encoder_works(encoder: str, deep: bool = False) -> bool:
+    """Encode a few black frames with the real quality flags; True on success.
+    deep=True tests 10-bit output (the flags _depth_args would use)."""
+    extra = _depth_args(encoder, deep=True) if deep else []
     cp = run([FFMPEG, "-hide_banner", "-v", "error",
               "-f", "lavfi", "-i", "color=c=black:s=640x480:r=30:d=0.2",
-              "-c:v", encoder] + quality_args(encoder) + ["-f", "null", "-"],
+              "-c:v", encoder] + quality_args(encoder) + extra + ["-f", "null", "-"],
              timeout=20, label="enc-test")
     return cp.returncode == 0
+
+
+_DEEP: dict[str, bool] = {}          # encoder -> 10-bit output works (lazy)
+_DEEP_LOCK = threading.Lock()
+
+
+def encodes_10bit(encoder: str) -> bool:
+    """True if `encoder` can write 10-bit here (HEVC/AV1 only; probed once)."""
+    if "h264" in encoder or "x264" in encoder:
+        return False
+    with _DEEP_LOCK:
+        if encoder not in _DEEP:
+            _DEEP[encoder] = _encoder_works(encoder, deep=True)
+        return _DEEP[encoder]
+
+
+def is_deep(pix_fmt: str) -> bool:
+    """True for >8-bit pixel formats (yuv420p10le, p010le, yuv422p12le, …)."""
+    return bool(re.search(r"1[0-6](le|be)$", pix_fmt))    # ffprobe always adds le/be
+
+
+def _depth_args(encoder: str, deep: bool) -> list[str]:
+    """Pixel format / profile so 10-bit sources stay 10-bit where the encoder
+    can, and 8-bit-only encoders (all H.264) get 8-bit input they accept."""
+    if not deep:
+        return ["-pix_fmt", "yuv420p"]
+    fmt = "yuv420p10le" if encoder.startswith("lib") else "p010le"
+    args = ["-pix_fmt", fmt]
+    if "hevc" in encoder:
+        args += ["-profile:v", "main10"]
+    return args
+
+
+def encode_args(encoder: str, info: dict) -> list[str]:
+    """Quality + pixel-format + colour-tag flags for re-encoding `info`'s video."""
+    deep = is_deep(info.get("pix_fmt", "")) and encodes_10bit(encoder)
+    args = quality_args(encoder) + _depth_args(encoder, deep)
+    for flag, val in (info.get("colors") or {}).items():
+        args += [flag, val]
+    return args
 
 
 def working_encoders() -> list[str]:
@@ -407,34 +462,63 @@ def quality_args(encoder: str) -> list[str]:
     return []
 
 
-def smart_fallback_encoder() -> str:
-    """Best working HW H.264 encoder for a frame-accurate re-encode, else x264."""
+def smart_fallback_encoder(info: dict | None = None) -> str:
+    """Encoder for Smart mode's frame-accurate re-encode.
+
+    Matches the source codec where a working HW encoder exists (HEVC stays
+    HEVC, AV1 stays AV1), keeps 10-bit sources 10-bit (HW, else libx265), and
+    otherwise uses HW H.264, then libx264.
+    """
+    info = info or {}
     working = working_encoders()
-    for enc in ("h264_videotoolbox", "h264_amf"):
-        if enc in working:
-            return enc
+    vcodec = info.get("vcodec", "")
+    deep = is_deep(info.get("pix_fmt", ""))
+    h264 = ["h264_videotoolbox", "h264_amf"]
+    hevc = ["hevc_videotoolbox", "hevc_amf"]
+    if vcodec == "av1":
+        prefer = ["av1_amf"] + hevc
+    elif vcodec == "hevc" or deep:
+        prefer = hevc + ["av1_amf"]
+    else:
+        prefer = h264
+    cands = [e for e in prefer if e in working]
+    if deep:
+        for enc in cands:
+            if encodes_10bit(enc):
+                return enc
+        if encodes_10bit("libx265"):
+            return "libx265"
+        log("  no 10-bit encoder works — re-encoding as 8-bit")
+    for enc in cands + [e for e in h264 if e in working]:
+        return enc
     return "libx264"
 
 
-def start_on_keyframe(path: str, start_time: str) -> bool:
+def keyframe_at(path: str, start_time: str, file_start: float = 0.0) -> float | None:
+    """Time (as ffmpeg -ss sees it) of a keyframe within ±10 ms of start_time,
+    or None. file_start is the container start_time: ffmpeg's -ss is relative
+    to it but ffprobe timestamps are absolute (MPEG-TS starts at ~1.4 s)."""
     start = time_to_seconds(start_time)
     if start is None:
-        return False
+        return None
+    t = start + file_start
+    # Absolute interval end (no '+'): ffprobe seeks to the keyframe at/before
+    # t-0.1 and reads on past t, so a keyframe just after t is still seen.
     cp = run([FFPROBE, "-v", "error", "-select_streams", "v:0",
               "-skip_frame", "nokey",
               "-show_entries", "frame=best_effort_timestamp_time",
-              "-read_intervals", f"{start:.3f}%+0.5",
+              "-read_intervals", f"{max(0.0, t - 0.1):.6f}%{t + 0.1:.6f}",
               "-of", "csv=p=0", path], label="keyframe")
     if cp.returncode != 0:
-        return False
+        return None
     for line in cp.stdout.splitlines():
         try:
-            ts = float(line.strip())
+            ts = float(line.strip().rstrip(","))
         except ValueError:
             continue
-        if abs(ts - start) <= 0.010:    # ~one frame tolerance
-            return True
-    return False
+        if abs(ts - t) <= 0.010:        # ~one frame tolerance
+            return ts - file_start
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -514,9 +598,18 @@ def detect_first_change(path: str) -> str:
 def build_trim_args(input_path: str, out_path: str, start: str, end: str,
                     encoder_mode: str) -> tuple[list[str], str]:
     """Return (ffmpeg_args, resolved_mode). end may be '' to trim to EOF."""
+    info = _probe(input_path)
     mode = encoder_mode
     if mode == "smart":
-        mode = "copy" if start_on_keyframe(input_path, start) else smart_fallback_encoder()
+        kf = keyframe_at(input_path, start, info.get("start", 0.0))
+        if kf is not None:
+            mode = "copy"
+            # Seek 1 ms past the keyframe's exact time: a copy seek lands on the
+            # last keyframe at/before -ss, and the UI's ms-rounded start can sit
+            # just before a keyframe (→ the whole previous GOP).
+            start = f"{kf + 0.001:.6f}"
+        else:
+            mode = smart_fallback_encoder(info)
 
     # Input seeking for both modes: with -c copy it snaps to the keyframe
     # before `start`; when re-encoding ffmpeg decodes from that keyframe and
@@ -534,7 +627,7 @@ def build_trim_args(input_path: str, out_path: str, start: str, end: str,
         # 0:V = video without attached pictures (cover art would otherwise be
         # fed to the video encoder); subtitles are copied, not re-encoded.
         args += ["-map", "0:V", "-map", "0:a?", "-map", "0:s?", "-dn",
-                 "-c:v", mode] + quality_args(mode)
+                 "-c:v", mode] + encode_args(mode, info)
         if ("hevc" in mode or mode == "libx265") \
                 and Path(out_path).suffix.lower() in (".mp4", ".mov", ".m4v"):
             args += ["-tag:v", "hvc1"]      # QuickTime / Apple players need hvc1
@@ -556,7 +649,7 @@ def trim_video(input_path: str, output_path: str, start: str, end: str,
     else:
         if not output_path:
             return False, "No output path specified"
-        if os.path.abspath(input_path) == os.path.abspath(output_path):
+        if os.path.exists(output_path) and os.path.samefile(input_path, output_path):
             return False, 'Output equals input — enable "Overwrite source" to replace it'
         out_path = output_path
 
@@ -731,6 +824,7 @@ class ScanThread(QThread):
             for e in os.listdir(self.folder)
             if (Path(self.folder) / e).is_file()
             and Path(e).suffix.lower() in VIDEO_EXTS
+            and ".vt_tmp." not in e             # leftover replace-source temp
         )
         total = len(files)
         rows: list[dict | None] = [None] * total

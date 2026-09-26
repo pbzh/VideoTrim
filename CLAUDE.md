@@ -31,7 +31,11 @@ There are **no tests** and no linter configured.
 
 **Quality flags** — centralized in `quality_args(encoder)`; each vendor uses a different rate-control knob: videotoolbox `-q:v 80`, amf `-rc cqp -qp_i 16 -qp_p 16 -quality quality` (no `qp_b` — av1_amf rejects it), libx26x `-crf 16 -preset medium`. Single source of truth — keep it that way when adding encoders.
 
-**Smart mode** — `build_trim_args()` resolves `smart` to `copy` when `start_on_keyframe()` says the start lands on a keyframe (±10 ms, probed via `ffprobe -skip_frame nokey`), else to `smart_fallback_encoder()`: first *working* of `h264_videotoolbox`/`h264_amf`, else `libx264`.
+**Smart mode** — `build_trim_args()` resolves `smart` to `copy` when `keyframe_at()` finds a keyframe within ±10 ms of start (`ffprobe -skip_frame nokey`), else to `smart_fallback_encoder(info)`.
+- ffprobe timestamps are absolute but ffmpeg `-ss` is relative to the container `start_time` (MPEG-TS ≈1.4 s) — `keyframe_at` adds/subtracts `info["start"]`.
+- Copy mode then seeks to the keyframe's exact time **+1 ms**, not the UI start: a copy seek lands on the last keyframe *at or before* `-ss`, so a ms-rounded start just before a keyframe would pull in the whole previous GOP.
+- `smart_fallback_encoder` matches the source: HEVC→HW HEVC, AV1→`av1_amf`, else HW H.264, then `libx264`. 10-bit sources (`is_deep`) stay 10-bit via a HW encoder that passes a 10-bit test encode (`encodes_10bit`, lazy + cached), else `libx265`.
+- `encode_args()` = `quality_args` + `_depth_args` (`p010le`/`yuv420p10le` + `main10` for 10-bit, else `yuv420p` — H.264 is always 8-bit) + source colour tags (primaries/trc/colorspace). HDR10 mastering-display/CLL side data is **not** carried over.
 
 **Trim ffmpeg args** — `build_trim_args()`; both modes put `-ss`/`-to` *before* `-i` (input seeking). `end` may be `''` to trim to EOF. Both use `-dn` (data tracks like iPhone `mebx`/GoPro `gpmd` break muxing; mov/mp4 regenerate timecode) and `-avoid_negative_ts make_zero`.
 - **Copy mode**: `-map 0 -c copy` → instant, snaps to the keyframe before start.
@@ -54,4 +58,5 @@ There are **no tests** and no linter configured.
 ## Conventions
 - `.gitattributes` enforces **LF line endings repo-wide** — do not introduce CRLF.
 - Times in the UI/params are `HH:MM:SS.mmm` (millisecond precision), passed straight to ffmpeg `-ss`/`-to`.
+- Time fields reject minutes/seconds ≥ 60. Output == input is detected with `os.path.samefile` (case-insensitive filesystems). Folder scan skips `*.vt_tmp.*` leftovers.
 - Output filename auto-derived with `_trimmed` suffix; existing-file overwrite is confirmed in the UI. Replace-source writes to a temp file first, then swaps.
