@@ -8,8 +8,9 @@ Minimal-quality-loss trimming built on ffmpeg:
   * Stream Copy     — instant, lossless, keyframe-aligned.
   * VideoToolbox    — hardware H.264 / HEVC, frame-accurate, near-lossless.
 
-Hardware encoders are auto-detected per machine: Apple VideoToolbox on macOS,
-AMD AMF and Intel Quick Sync on Windows (software x264 is the fallback).
+Hardware encoders are auto-detected per machine (each is test-encoded once at
+startup): Apple VideoToolbox on macOS, AMD AMF on Windows (software x264 is the
+fallback).
 
 Extras:
   * Detect Start    — find the first real frame change (skip a frozen intro).
@@ -351,17 +352,46 @@ _HW_ENCODERS = [
      "AMD hardware HEVC (Windows) — smaller files"),
     ("AV1 (AMD AMF)", "av1_amf",
      "AMD hardware AV1 (RDNA3+, Windows) — best compression"),
-    ("H.264 (Intel QSV)", "h264_qsv", "Intel Quick Sync H.264"),
-    ("HEVC (Intel QSV)", "hevc_qsv", "Intel Quick Sync HEVC"),
-    ("AV1 (Intel QSV)", "av1_qsv", "Intel Quick Sync AV1"),
 ]
 
 
+_WORKING: list[str] | None = None     # HW encoders that passed a test encode
+_WORKING_LOCK = threading.Lock()
+
+
+def _encoder_works(encoder: str) -> bool:
+    """Encode a few black frames with the real quality flags; True on success."""
+    cp = run([FFMPEG, "-hide_banner", "-v", "error",
+              "-f", "lavfi", "-i", "color=c=black:s=640x480:r=30:d=0.2",
+              "-c:v", encoder] + quality_args(encoder) + ["-f", "null", "-"],
+             timeout=20, label="enc-test")
+    return cp.returncode == 0
+
+
+def working_encoders() -> list[str]:
+    """HW encoders that actually work on this machine (probed once, cached).
+
+    `ffmpeg -encoders` only says what the build was compiled with — common
+    Windows builds list AMF on any GPU — so each candidate is test-encoded.
+    """
+    global _WORKING
+    with _WORKING_LOCK:
+        if _WORKING is None:
+            out = run([FFMPEG, "-hide_banner", "-encoders"], label="encoders").stdout or ""
+            listed = [enc for (_, enc, _) in _HW_ENCODERS if enc in out]
+            ok = []
+            if listed:
+                with ThreadPoolExecutor(max_workers=len(listed)) as ex:
+                    ok = list(ex.map(_encoder_works, listed))
+            _WORKING = [enc for enc, good in zip(listed, ok) if good]
+            log(f"→ working HW encoders: {', '.join(_WORKING) or 'none'}")
+        return _WORKING
+
+
 def available_encoders() -> list[dict]:
-    cp = run([FFMPEG, "-hide_banner", "-encoders"], label="encoders")
-    out = cp.stdout or ""
+    working = working_encoders()
     return [{"label": lbl, "encoder": enc, "hint": hint}
-            for (lbl, enc, hint) in _HW_ENCODERS if enc in out]
+            for (lbl, enc, hint) in _HW_ENCODERS if enc in working]
 
 
 def quality_args(encoder: str) -> list[str]:
@@ -369,19 +399,16 @@ def quality_args(encoder: str) -> list[str]:
         return ["-q:v", "80"]           # 1-100, higher = better; ~visually lossless
     if "amf" in encoder:                # AMD: constant-QP, lower = better; no qp_b (av1)
         return ["-rc", "cqp", "-qp_i", "16", "-qp_p", "16", "-quality", "quality"]
-    if "qsv" in encoder:                # Intel: ICQ global_quality, lower = better
-        return ["-global_quality", "16"]
     if "libx26" in encoder:
         return ["-crf", "16", "-preset", "medium"]
     return []
 
 
 def smart_fallback_encoder() -> str:
-    """Best available HW encoder for a frame-accurate re-encode, by platform."""
-    out = (run([FFMPEG, "-hide_banner", "-encoders"], label="encoders").stdout or "")
-    prefer = ["h264_videotoolbox"] if sys.platform == "darwin" else ["h264_amf", "h264_qsv"]
-    for enc in prefer:
-        if enc in out:
+    """Best working HW H.264 encoder for a frame-accurate re-encode, else x264."""
+    working = working_encoders()
+    for enc in ("h264_videotoolbox", "h264_amf"):
+        if enc in working:
             return enc
     return "libx264"
 
@@ -413,6 +440,10 @@ def start_on_keyframe(path: str, start_time: str) -> bool:
 
 _FS_RE = re.compile(r"freeze_start:\s*([\d.]+)")
 _FE_RE = re.compile(r"freeze_end:\s*([\d.]+)")
+_PROGRESS_RE = re.compile(r"time=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+# A frozen intro (freeze_start < 0.5 s, d=1) is reported by ~1.5 s of media;
+# once progress passes this without one, there is no frozen intro.
+_INTRO_GIVEUP_SEC = 3.0
 
 
 def parse_initial_freeze(text: str) -> tuple[bool, float, bool]:
@@ -436,11 +467,12 @@ def parse_initial_freeze(text: str) -> tuple[bool, float, bool]:
 def detect_first_change(path: str) -> str:
     """First real frame change as HH:MM:SS.mmm ('' if no ≥1s frozen intro).
 
-    Streams ffmpeg and stops the moment the first freeze_end is seen, so it
-    only decodes up to the first change instead of the whole file.
+    Streams ffmpeg and stops the moment the first freeze_end is seen, or once
+    progress passes _INTRO_GIVEUP_SEC with no frozen intro, so it only decodes
+    the start of the file instead of the whole thing.
     """
     log_file("detect", path)
-    args = [FFMPEG, "-hide_banner", "-i", path,
+    args = [FFMPEG, "-hide_banner", "-stats", "-i", path,
             "-vf", "freezedetect=n=-40dB:d=1", "-map", "0:v:0", "-f", "null", "-"]
     log_cmd("detect", args)
     proc = spawn(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -457,6 +489,12 @@ def detect_first_change(path: str) -> str:
                 m = _FE_RE.search(line)
                 if m:
                     result = seconds_to_time(float(m.group(1)))
+                    proc.kill()
+                    break
+            elif not frozen and "time=" in line:
+                m = _PROGRESS_RE.search(line)
+                if m and (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                          + float(m.group(3))) > _INTRO_GIVEUP_SEC:
                     proc.kill()
                     break
         proc.wait()
@@ -539,17 +577,32 @@ def trim_video(input_path: str, output_path: str, start: str, end: str,
 
     final = out_path
     if replace_source:
-        try:
-            os.replace(out_path, input_path)   # atomic on same filesystem
-        except OSError as e:
+        err = _replace_file(out_path, input_path)
+        if err:
             _silent_remove(out_path)
-            return False, f"Trim ok but could not replace source: {e}"
+            return False, f"Trim ok but could not replace source: {err}"
         final = input_path
 
     how = "lossless copy" if mode == "copy" else f"re-encoded ({mode})"
     verb = "Replaced source" if replace_source else "Saved"
     log(f"→ trim {os.path.basename(input_path)}: OK ({how}, {size_mb:.1f} MB)")
     return True, f"Done — {how}, {verb} ({size_mb:.1f} MB): {final}"
+
+
+def _replace_file(src: str, dst: str) -> OSError | None:
+    """os.replace (atomic on same filesystem), retried briefly on Windows
+    sharing violations — AV scanners/indexers may hold a file for a moment."""
+    err: OSError | None = None
+    for _ in range(5):
+        try:
+            os.replace(src, dst)
+            return None
+        except PermissionError as e:
+            err = e
+            time.sleep(0.5)
+        except OSError as e:
+            return e
+    return err
 
 
 def _silent_remove(path: str) -> None:
@@ -750,6 +803,8 @@ class ScanDialog(QDialog):
     """Table of scan results with per-file selection and batch trim."""
 
     load_file = pyqtSignal(str, str)   # (path, start_time)
+    batch_started = pyqtSignal(list)   # source paths about to be replaced
+    batch_finished = pyqtSignal()
 
     COLS = ["", "File", "Frozen intro", "First change", "Freeze (s)"]
 
@@ -884,6 +939,7 @@ class ScanDialog(QDialog):
         self.stop_btn.setEnabled(True)
         self.status.setText(f"Trimming {len(items)} file(s)…")
 
+        self.batch_started.emit([it["path"] for it in items])
         self.batch = BatchThread(items)
         self.batch.progress.connect(self._on_batch_progress)
         self.batch.done.connect(self._on_batch_done)
@@ -908,6 +964,7 @@ class ScanDialog(QDialog):
             msg += "  First error: " + res["errors"][0]
         self.status.setText(msg)
         self._update_trim_btn()
+        self.batch_finished.emit()
 
     def closeEvent(self, e):
         if self.batch:
@@ -980,6 +1037,7 @@ class VideoTrim(QMainWindow):
         self.trim_thread: TrimThread | None = None
         self.scan_thread: ScanThread | None = None
         self.log_window: LogWindow | None = None
+        self._preview_released = False
 
         self._build_ui()
         self._build_menu()
@@ -1363,6 +1421,8 @@ class VideoTrim(QMainWindow):
                 return
 
         self.player.pause()
+        if replace:
+            self._release_preview()
         self.trim_btn.setEnabled(False)
         self._show_status("Trimming…", "")
         self.trim_thread = TrimThread(
@@ -1370,16 +1430,33 @@ class VideoTrim(QMainWindow):
             start=ms_to_time(s), end=ms_to_time(e),
             encoder_mode=self.combo.currentData(), replace_source=replace,
         )
-        self._trim_replaced = replace
         self.trim_thread.done.connect(self._on_trim_done)
         self.trim_thread.start()
 
     def _on_trim_done(self, ok: bool, msg: str):
         self.trim_btn.setEnabled(True)
         self._show_status(msg, "success" if ok else "error")
-        if ok and self._trim_replaced:
-            self.player.setSource(QUrl())
-            self.player.setSource(QUrl.fromLocalFile(self.current_path))
+        self._restore_preview()
+
+    # The player keeps the file open; on Windows that makes os.replace() over
+    # the source fail with a sharing violation, so unload it while replacing.
+    def _release_preview(self):
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self._preview_released = True
+
+    def _restore_preview(self):
+        if self._preview_released:
+            self._preview_released = False
+            if self.current_path:
+                self.player.setSource(QUrl.fromLocalFile(self.current_path))
+
+    def _on_batch_started(self, paths: list):
+        if not self.current_path:
+            return
+        cur = os.path.normcase(os.path.abspath(self.current_path))
+        if any(os.path.normcase(os.path.abspath(p)) == cur for p in paths):
+            self._release_preview()
 
     # ---- Global stop -----------------------------------------------------
 
@@ -1441,6 +1518,8 @@ class VideoTrim(QMainWindow):
         self.scan_status.setText(f"{len(rows)} file(s) — {frozen_n} with a frozen intro (first {win}s).")
         dlg = ScanDialog(rows, float(win), self)
         dlg.load_file.connect(self.load_video)
+        dlg.batch_started.connect(self._on_batch_started)
+        dlg.batch_finished.connect(self._restore_preview)
         dlg.exec()
 
     # ---- Status ----------------------------------------------------------

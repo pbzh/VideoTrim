@@ -35,9 +35,10 @@ Single-file PyQt6 app. Key pieces:
   - macOS → VideoToolbox (`h264/hevc_videotoolbox`), quality `-q:v 80`.
   - Windows AMD → AMF (`h264/hevc/av1_amf`), quality `-rc cqp -qp_i 16 -qp_p 16
     -quality quality` (no `-qp_b`; av1_amf rejects it).
-  - Windows Intel → QSV (`h264/hevc/av1_qsv`), quality `-global_quality 16`.
   - Fallback software `libx264` `-crf 16 -preset medium`.
-  - `smart_fallback_encoder`: darwin→videotoolbox, else→amf then qsv, else x264.
+  - Encoders are test-encoded once at startup (`working_encoders`); listed-but-
+    broken ones are hidden. Intel QSV support was removed.
+  - `smart_fallback_encoder`: first working of videotoolbox/amf, else x264.
 - **Smart mode** (`build_trim_args`): lossless stream-copy when the start lands
   on a keyframe (`start_on_keyframe` via ffprobe), else a frame-accurate
   near-lossless HW re-encode. `EndTime` optional ("" = trim to EOF).
@@ -72,7 +73,7 @@ Single-file PyQt6 app. Key pieces:
 
 ## VERIFIED vs NOT
 
-Verified on macOS: encoder detection (VT only, AMF/QSV correctly filtered out),
+Verified on macOS: encoder detection (VT only, AMF correctly filtered out),
 detect (2.0s intro → `00:00:02.000`, moving clip → none), replace-source trim
 (5s→3s, no leftover temp), scan classification, batch trim (2/2, sources
 replaced), log capture (command + file summary + result), Stop All (kills a live

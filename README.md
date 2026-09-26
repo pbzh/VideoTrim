@@ -8,7 +8,7 @@ A simple, fast desktop video trimmer built with **Python + PyQt6** (`videotrim.p
 - **Millisecond-precision** trim range with manual entry or set-from-playhead buttons
 - **Smart mode** (default) — lossless stream-copy when the start is on a keyframe, otherwise a frame-accurate near-lossless hardware re-encode
 - **Stream copy mode** — instant, lossless trimming with no re-encoding (cuts on nearest keyframe)
-- **Hardware-accelerated encoding** — frame-accurate trimming using Apple VideoToolbox (H.264, HEVC), AMD AMF (H.264, HEVC, AV1), or Intel Quick Sync Video (H.264, HEVC, AV1)
+- **Hardware-accelerated encoding** — frame-accurate trimming using Apple VideoToolbox (H.264, HEVC), or AMD AMF (H.264, HEVC, AV1)
 - **Cross-platform** — runs on macOS (ARM and Intel) and Windows
 - Displays video format, codec, and audio information
 - Auto-generates output filename (`_trimmed` suffix)
@@ -20,8 +20,8 @@ A simple, fast desktop video trimmer built with **Python + PyQt6** (`videotrim.p
 Runs on macOS (Apple Silicon and Intel) and Windows: Smart / Stream-Copy /
 hardware-encode trimming, Detect Start, Overwrite source, and the Folder Freeze
 Scan (table + batch-trim selected files in place, with a live log and Stop).
-Hardware encoding is Apple VideoToolbox on macOS and AMD AMF or Intel Quick Sync
-on Windows; software x264 is the fallback.
+Hardware encoding is Apple VideoToolbox on macOS and AMD AMF on Windows; software
+x264 is the fallback.
 
 ### Requirements
 
@@ -125,10 +125,9 @@ The installer layout is defined in [`installer.iss`](installer.iss); bump
 4. Choose an encoding mode:
    - **Stream Copy** — fastest, no quality loss, but trims to the nearest keyframe
    - **H.264 / HEVC (VideoToolbox)** — hardware-accelerated, frame-accurate *(macOS)*
-   - **H.264 / HEVC / AV1 (Intel QSV)** — hardware-accelerated, frame-accurate *(Intel GPU)*
    - **H.264 / HEVC / AV1 (AMD AMF)** — hardware-accelerated, frame-accurate *(AMD GPU)*
 
-   Hardware encoding options are auto-detected at startup and only shown when your system supports them.
+   Hardware encoding options are auto-detected at startup (each is test-encoded) and only shown when they actually work on your system.
 5. Optionally change the output path
 6. Click **Trim Video**
 
@@ -148,24 +147,16 @@ MP4, MKV, AVI, MOV, TS, FLV, WMV, WebM, M4V, MPG, MPEG, 3GP — any format suppo
 | Stream Copy | Instant | Keyframe-aligned | Lossless | Any system |
 | H.264 / HEVC (VideoToolbox) | Fast | Frame-accurate | Near-lossless (q 80) | macOS |
 | H.264 / HEVC / AV1 (AMD AMF) | Fast | Frame-accurate | Near-lossless (cqp 16) | Windows + AMD GPU |
-| H.264 / HEVC / AV1 (Intel QSV) | Fast | Frame-accurate | Near-lossless (global_quality 16) | Intel GPU with QSV |
 
 **Stream copy** places `-ss` before `-i` (input seeking) for maximum speed. **Re-encode modes** place `-ss` after `-i` (output seeking) for frame-accurate cuts.
 
-Hardware encoders are auto-detected by probing `ffmpeg -encoders` at startup. Only encoders available on your system are shown in the UI.
-
-### Intel QSV requirements
-
-- **Windows:** Install the latest Intel graphics driver. QSV is supported on most Intel CPUs with integrated graphics (6th gen+) and Intel Arc discrete GPUs.
-- **Linux:** Install the Intel Media SDK or oneVPL runtime (`intel-media-va-driver` on Debian/Ubuntu). Your ffmpeg must be built with `--enable-libmfx` or `--enable-libvpl`.
+Hardware encoders are auto-detected at startup: each one `ffmpeg -encoders` lists is test-encoded on a few black frames, because ffmpeg builds list encoders (e.g. AMF on Windows) whether or not the GPU supports them. Only encoders that pass are shown in the UI and used by Smart mode.
 
 ### AMD AMF requirements (Windows)
 
 - Install the latest AMD Adrenalin graphics driver. AMF H.264/HEVC is supported on most modern Radeon GPUs and Ryzen APUs.
 - AV1 hardware encoding requires an RDNA3 GPU (Radeon RX 7000 series) or newer.
 - Your ffmpeg must be built with `--enable-amf` (standard Windows ffmpeg builds are).
-
-AV1 hardware encoding via Intel requires Intel Arc (Alchemist/DG2) or newer.
 
 ## License
 
