@@ -188,10 +188,13 @@ _PROCS: set[subprocess.Popen] = set()
 _PROCS_LOCK = threading.Lock()
 _WORKERS: set = set()               # QThreads exposing .cancel()
 _WORKERS_LOCK = threading.Lock()
+_SHUTDOWN = threading.Event()       # set on app close: refuse new processes
 
 
 def spawn(args: list[str], **kw) -> subprocess.Popen:
     """Start a tracked subprocess so Stop All can kill it."""
+    if _SHUTDOWN.is_set():
+        raise RuntimeError("shutting down")
     if _NO_WINDOW:
         kw.setdefault("creationflags", _NO_WINDOW)
     p = subprocess.Popen(args, **kw)
@@ -515,19 +518,28 @@ def build_trim_args(input_path: str, out_path: str, start: str, end: str,
     if mode == "smart":
         mode = "copy" if start_on_keyframe(input_path, start) else smart_fallback_encoder()
 
+    # Input seeking for both modes: with -c copy it snaps to the keyframe
+    # before `start`; when re-encoding ffmpeg decodes from that keyframe and
+    # discards frames up to `start` (accurate_seek), so the cut is still
+    # frame-accurate without decoding the file from 0.
+    args = ["-y", "-ss", start]
+    if end:
+        args += ["-to", end]
+    args += ["-i", input_path]
+    # -dn: data tracks (iPhone mebx, GoPro gpmd, tmcd) can't be muxed into
+    # most containers; mov/mp4 regenerate timecode from metadata anyway.
     if mode == "copy":
-        args = ["-y", "-ss", start]
-        if end:
-            args += ["-to", end]
-        args += ["-i", input_path, "-c", "copy", "-map", "0",
-                 "-avoid_negative_ts", "make_zero", out_path]
+        args += ["-map", "0", "-dn", "-c", "copy"]
     else:
-        args = ["-y", "-i", input_path, "-ss", start]
-        if end:
-            args += ["-to", end]
-        args += ["-c:v", mode] + quality_args(mode)
-        args += ["-c:a", "aac", "-b:a", "192k", "-map", "0",
-                 "-avoid_negative_ts", "make_zero", out_path]
+        # 0:V = video without attached pictures (cover art would otherwise be
+        # fed to the video encoder); subtitles are copied, not re-encoded.
+        args += ["-map", "0:V", "-map", "0:a?", "-map", "0:s?", "-dn",
+                 "-c:v", mode] + quality_args(mode)
+        if ("hevc" in mode or mode == "libx265") \
+                and Path(out_path).suffix.lower() in (".mp4", ".mov", ".m4v"):
+            args += ["-tag:v", "hvc1"]      # QuickTime / Apple players need hvc1
+        args += ["-c:a", "aac", "-b:a", "192k", "-c:s", "copy"]
+    args += ["-avoid_negative_ts", "make_zero", out_path]
     return args, mode
 
 
@@ -565,8 +577,7 @@ def trim_video(input_path: str, output_path: str, start: str, end: str,
         _release(proc)
 
     if proc.returncode != 0:
-        if replace_source:
-            _silent_remove(out_path)
+        _silent_remove(out_path)            # partial / killed output is junk
         tail = out[-1500:] if len(out) > 1500 else out
         log(f"→ trim {os.path.basename(input_path)}: FAILED (exit {proc.returncode})")
         return False, f"ffmpeg error (exit {proc.returncode}):\n{tail}"
@@ -638,7 +649,10 @@ class TrimThread(QThread):
         self.params = params
 
     def run(self):
-        ok, msg = trim_video(**self.params)
+        try:
+            ok, msg = trim_video(**self.params)
+        except Exception as e:
+            ok, msg = False, f"Trim failed: {e}"
         self.done.emit(ok, msg)
 
 
@@ -777,11 +791,14 @@ class BatchThread(QThread):
             for i, it in enumerate(self.items):
                 if self._cancel.is_set():
                     break
-                ok, msg = trim_video(
-                    input_path=it["path"], output_path="", start=it["start"],
-                    end="", encoder_mode="smart", replace_source=True,
-                    on_proc=self._register,
-                )
+                try:
+                    ok, msg = trim_video(
+                        input_path=it["path"], output_path="", start=it["start"],
+                        end="", encoder_mode="smart", replace_source=True,
+                        on_proc=self._register,
+                    )
+                except Exception as e:
+                    ok, msg = False, f"Trim failed: {e}"
                 if ok:
                     succeeded += 1
                 else:
@@ -1284,25 +1301,37 @@ class VideoTrim(QMainWindow):
             self.frame_ms = max(1, round(1000 / info["fps"]))
         self.info_duration_ms = info["duration_ms"]
 
+        # Reset from ffprobe, not the player: nothing carries over from the
+        # previous file, and a file the preview can't decode is still trimmable.
+        self.player.stop()
+        self._set_duration(self.info_duration_ms)
+        self.pos_label.setText(ms_to_time(0))
+        self.slider.setValue(0)
+        self.start_in.setText(preset_start or ms_to_time(0))
+        self.end_in.setText(ms_to_time(self.info_duration_ms))
+
         self.player.setSource(QUrl.fromLocalFile(path))
         if Path(path).suffix.lower() not in PREVIEWABLE:
             self._show_status("Preview may not display this format; trimming still works.", "")
 
         self.output_path.setText(str(Path(path).with_name(Path(path).stem + "_trimmed" + Path(path).suffix)))
         self._set_controls_enabled(True)
-
-        if preset_start:
-            self.start_in.setText(preset_start)
         self._on_times_changed()
 
     # ---- Player events ---------------------------------------------------
 
+    def _set_duration(self, ms: int):
+        self.duration_ms = ms
+        self.slider.setRange(0, ms)
+        self.total_label.setText(ms_to_time(ms))
+
     def _on_duration(self, ms: int):
-        self.duration_ms = ms if ms > 0 else self.info_duration_ms
-        self.slider.setRange(0, self.duration_ms)
-        self.total_label.setText(ms_to_time(self.duration_ms))
-        if time_to_ms(self.end_in.text()) <= 0 or self.end_in.text() == "00:00:00.000":
-            self.end_in.setText(ms_to_time(self.duration_ms))
+        if ms <= 0:
+            return
+        self._set_duration(ms)
+        # End was set from ffprobe on load; only fill it if that was unknown.
+        if time_to_ms(self.end_in.text()) <= 0:
+            self.end_in.setText(ms_to_time(ms))
         self._on_times_changed()
 
     def _on_position(self, ms: int):
@@ -1435,8 +1464,8 @@ class VideoTrim(QMainWindow):
 
     def _on_trim_done(self, ok: bool, msg: str):
         self.trim_btn.setEnabled(True)
-        self._show_status(msg, "success" if ok else "error")
         self._restore_preview()
+        self._show_status(msg, "success" if ok else "error")
 
     # The player keeps the file open; on Windows that makes os.replace() over
     # the source fail with a sharing violation, so unload it while replacing.
@@ -1446,10 +1475,11 @@ class VideoTrim(QMainWindow):
         self._preview_released = True
 
     def _restore_preview(self):
+        # Full reload: the replaced file is shorter, so the range must reset.
         if self._preview_released:
             self._preview_released = False
             if self.current_path:
-                self.player.setSource(QUrl.fromLocalFile(self.current_path))
+                self.load_video(self.current_path)
 
     def _on_batch_started(self, paths: list):
         if not self.current_path:
@@ -1530,11 +1560,14 @@ class VideoTrim(QMainWindow):
         self.status.setText(msg)
 
     def closeEvent(self, e):
+        # Refuse new ffmpeg spawns (a Smart trim may be between its keyframe
+        # probe and the encode), kill running ones, then let threads unwind so
+        # none is destroyed mid-run and no ffmpeg outlives the app.
+        _SHUTDOWN.set()
+        stop_all()
         for t in (self.scan_thread, self.trim_thread, self.detect_thread):
             if t and t.isRunning():
-                if hasattr(t, "cancel"):
-                    t.cancel()
-                t.wait(2000)
+                t.wait(5000)
         super().closeEvent(e)
 
 

@@ -148,7 +148,7 @@ MP4, MKV, AVI, MOV, TS, FLV, WMV, WebM, M4V, MPG, MPEG, 3GP — any format suppo
 | H.264 / HEVC (VideoToolbox) | Fast | Frame-accurate | Near-lossless (q 80) | macOS |
 | H.264 / HEVC / AV1 (AMD AMF) | Fast | Frame-accurate | Near-lossless (cqp 16) | Windows + AMD GPU |
 
-**Stream copy** places `-ss` before `-i` (input seeking) for maximum speed. **Re-encode modes** place `-ss` after `-i` (output seeking) for frame-accurate cuts.
+All modes place `-ss` before `-i` (input seeking). **Stream copy** snaps to the keyframe before the start point. **Re-encode modes** stay frame-accurate — ffmpeg decodes from that keyframe and discards frames before the start — without decoding the file from the beginning. Data tracks (e.g. iPhone/GoPro metadata) are dropped; re-encodes drop cover art and copy subtitles; HEVC in MP4/MOV is tagged `hvc1` so it plays in QuickTime.
 
 Hardware encoders are auto-detected at startup: each one `ffmpeg -encoders` lists is test-encoded on a few black frames, because ffmpeg builds list encoders (e.g. AMF on Windows) whether or not the GPU supports them. Only encoders that pass are shown in the UI and used by Smart mode.
 
