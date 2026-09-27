@@ -1,0 +1,75 @@
+name: Build macOS (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - videotrim.py
+      - build-macos.sh
+      - assets/**
+      - .github/workflows/build-macos.yml
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14          # Apple Silicon runner -> arm64 build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          brew install ffmpeg
+          python3 -m pip install --upgrade pip
+          python3 -m pip install PyQt6 PyQt6-Qt6 PyQt6-sip pyinstaller
+
+      - name: Build VideoTrim.app
+        run: ./build-macos.sh
+
+      - name: Check bundle is self-contained
+        run: |
+          APP=build/macos-python/dist/VideoTrim.app
+          # Homebrew's ffmpeg links against dylibs in /opt/homebrew; PyInstaller
+          # must have collected and relinked all of them, or the app only runs
+          # on machines that have Homebrew's ffmpeg installed.
+          bad=0
+          while IFS= read -r f; do
+            if file "$f" | grep -q 'Mach-O'; then
+              # dependencies only (LC_LOAD_*), not the dylib's own install name
+              if otool -l "$f" | awk '/cmd LC_(LOAD|LOAD_WEAK|REEXPORT)_DYLIB/ {getline; getline; print $2}' \
+                  | grep -E '^(/opt/homebrew|/usr/local)'; then
+                echo "::error::$f links outside the bundle"; bad=1
+              fi
+            fi
+          done < <(find "$APP" -type f)
+          lipo -archs "$APP/Contents/MacOS/VideoTrim"
+          exit $bad
+
+      - name: Smoke test
+        run: |
+          APP=build/macos-python/dist/VideoTrim.app
+          FW="$APP/Contents/Frameworks"
+          # Hide Homebrew so only bundled binaries/libs can be used.
+          export PATH=/usr/bin:/bin
+          "$FW/ffmpeg" -hide_banner -version | head -1
+          "$FW/ffprobe" -hide_banner -version | head -1
+          "$FW/ffmpeg" -hide_banner -v error -f lavfi -i testsrc2=s=640x360:d=1 \
+            -c:v libx264 -f null -
+          QT_QPA_PLATFORM=offscreen "$APP/Contents/MacOS/VideoTrim" &
+          pid=$!
+          sleep 8
+          kill -0 $pid   # still running = started without crashing
+          kill $pid
+
+      - name: Zip app
+        run: |
+          cd build/macos-python/dist
+          ditto -c -k --keepParent VideoTrim.app VideoTrim-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoTrim-macos-arm64
+          path: build/macos-python/dist/VideoTrim-macos-arm64.zip
+          retention-days: 30
