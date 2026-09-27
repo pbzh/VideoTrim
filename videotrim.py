@@ -310,7 +310,7 @@ def _probe(path: str) -> dict:
     info: dict = {
         "format": fmt.get("format_name", ""),
         "vcodec": "", "acodec": "", "duration_ms": 0, "fps": 0.0, "w": 0, "h": 0,
-        "start": 0.0, "pix_fmt": "", "colors": {},
+        "start": 0.0, "pix_fmt": "", "colors": {}, "cover": False,
     }
     try:
         info["duration_ms"] = int(float(fmt.get("duration", 0)) * 1000)
@@ -324,7 +324,10 @@ def _probe(path: str) -> dict:
 
     for st in data.get("streams", []):
         kind = st.get("codec_type")
-        if kind == "video" and not info["vcodec"]:
+        if (st.get("disposition") or {}).get("attached_pic"):
+            info["cover"] = True
+        if kind == "video" and not info["vcodec"] \
+                and not (st.get("disposition") or {}).get("attached_pic"):
             info["vcodec"] = st.get("codec_name", "")
             info["w"] = st.get("width", 0) or 0
             info["h"] = st.get("height", 0) or 0
@@ -494,30 +497,49 @@ def smart_fallback_encoder(info: dict | None = None) -> str:
     return "libx264"
 
 
-def keyframe_at(path: str, start_time: str, file_start: float = 0.0) -> float | None:
-    """Time (as ffmpeg -ss sees it) of a keyframe within ±10 ms of start_time,
-    or None. file_start is the container start_time: ffmpeg's -ss is relative
-    to it but ffprobe timestamps are absolute (MPEG-TS starts at ~1.4 s)."""
-    start = time_to_seconds(start_time)
-    if start is None:
-        return None
+_SEEK_MARGIN = 1.0      # s before the keyframe for the coarse input seek
+
+
+def keyframe_before(path: str, start: float, file_start: float = 0.0,
+                    fps: float = 0.0) -> tuple[float, float] | None:
+    """(pts, dts) — as ffmpeg -ss sees them — of the last video keyframe shown
+    before start + one frame: the keyframe a cut at `start` begins in, or the
+    keyframe that *is* the first frame at/after `start`. None if not found.
+
+    Reads packet flags only (demux, no decode). file_start is the container
+    start_time: ffmpeg's -ss is relative to it but ffprobe timestamps are
+    absolute (MPEG-TS starts at ~1.4 s).
+    """
     t = start + file_start
-    # Absolute interval end (no '+'): ffprobe seeks to the keyframe at/before
-    # t-0.1 and reads on past t, so a keyframe just after t is still seen.
-    cp = run([FFPROBE, "-v", "error", "-select_streams", "v:0",
-              "-skip_frame", "nokey",
-              "-show_entries", "frame=best_effort_timestamp_time",
-              "-read_intervals", f"{max(0.0, t - 0.1):.6f}%{t + 0.1:.6f}",
-              "-of", "csv=p=0", path], label="keyframe")
-    if cp.returncode != 0:
-        return None
-    for line in cp.stdout.splitlines():
-        try:
-            ts = float(line.strip().rstrip(","))
-        except ValueError:
-            continue
-        if abs(ts - t) <= 0.010:        # ~one frame tolerance
-            return ts - file_start
+    limit = t + (1.0 / fps if fps > 0 else 0.010) - 0.001
+    # 10 s back covers normal GOPs; else scan from the file start. ffprobe may
+    # land anywhere, so only a keyframe read contiguously up to `limit` counts.
+    for back in (10.0, None):
+        lo = "" if back is None else f"{max(0.0, t - back):.6f}"
+        cp = run([FFPROBE, "-v", "error", "-select_streams", "V:0",
+                  "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0",
+                  "-read_intervals", f"{lo}%{limit:.6f}", path], label="keyframe")
+        if cp.returncode != 0:
+            return None
+        best = None
+        for line in cp.stdout.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) < 3 or "K" not in parts[2]:
+                continue
+            try:
+                pts = float(parts[0])
+            except ValueError:
+                continue
+            try:
+                dts = float(parts[1])
+            except ValueError:
+                dts = pts
+            if pts < limit and (best is None or pts > best[0]):
+                best = (pts, dts)
+        if best is not None:
+            return best[0] - file_start, best[1] - file_start
+        if back is None or t - back <= 0:
+            break
     return None
 
 
@@ -599,26 +621,37 @@ def build_trim_args(input_path: str, out_path: str, start: str, end: str,
                     encoder_mode: str) -> tuple[list[str], str]:
     """Return (ffmpeg_args, resolved_mode). end may be '' to trim to EOF."""
     info = _probe(input_path)
+    s = time_to_seconds(start) or 0.0
+    kf = keyframe_before(input_path, s, info.get("start", 0.0), info.get("fps", 0.0))
     mode = encoder_mode
     if mode == "smart":
-        kf = keyframe_at(input_path, start, info.get("start", 0.0))
-        if kf is not None:
-            mode = "copy"
-            # Seek 1 ms past the keyframe's exact time: a copy seek lands on the
-            # last keyframe at/before -ss, and the UI's ms-rounded start can sit
-            # just before a keyframe (→ the whole previous GOP).
-            start = f"{kf + 0.001:.6f}"
-        else:
-            mode = smart_fallback_encoder(info)
+        # Lossless only if the first frame at/after start is a keyframe
+        # (±10 ms for the UI's ms rounding).
+        mode = "copy" if kf is not None and kf[0] >= s - 0.010             else smart_fallback_encoder(info)
 
-    # Input seeking for both modes: with -c copy it snaps to the keyframe
-    # before `start`; when re-encoding ffmpeg decodes from that keyframe and
-    # discards frames up to `start` (accurate_seek), so the cut is still
-    # frame-accurate without decoding the file from 0.
-    args = ["-y", "-ss", start]
-    if end:
-        args += ["-to", end]
-    args += ["-i", input_path]
+    if kf is None or (mode == "copy" and info.get("cover")):
+        # Plain input seek — exact in indexed containers (mp4/mov/mkv). Used
+        # when there is no keyframe info, and for copies with cover art, whose
+        # single packet an output -ss would drop. Copy seeks 1 ms past the
+        # keyframe: it lands on the last keyframe at/before -ss.
+        if kf is not None:
+            start = f"{kf[0] + 0.001:.6f}"
+        args = ["-y", "-ss", start] + (["-to", end] if end else []) + ["-i", input_path]
+    else:
+        # Coarse input seek to before the keyframe, then an exact output seek.
+        # Input seeking alone is unsafe: in MPEG-TS/PS (no index) it lands
+        # mid-GOP, so video only starts at the *next* keyframe. The margin
+        # covers B-frame decode delay. Re-encode decodes from the keyframe and
+        # drops frames before `start` — frame-accurate without decoding from 0.
+        # Copy starts at the keyframe itself: ffmpeg drops copied packets whose
+        # *dts* is before the output -ss, so cut at the keyframe's dts.
+        pts, dts = kf
+        seek = max(0.0, min(pts, dts) - _SEEK_MARGIN)
+        cut = dts - 0.001 if mode == "copy" else s
+        args = ["-y", "-ss", f"{seek:.6f}", "-i", input_path,
+                "-ss", f"{max(0.0, cut - seek):.6f}"]
+        if end:
+            args += ["-to", f"{(time_to_seconds(end) or 0.0) - seek:.6f}"]
     # -dn: data tracks (iPhone mebx, GoPro gpmd, tmcd) can't be muxed into
     # most containers; mov/mp4 regenerate timecode from metadata anyway.
     if mode == "copy":
